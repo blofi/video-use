@@ -131,8 +131,8 @@ def is_hdr_source(video: Path) -> bool:
         return False
 
 
-def is_portrait_source(video: Path) -> bool:
-    """Return True if the video's height > width (portrait / vertical)."""
+def get_video_dimensions(video: Path) -> tuple[int, int]:
+    """Return (width, height) of the first video stream. Returns (0, 0) on error."""
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -141,9 +141,84 @@ def is_portrait_source(video: Path) -> bool:
             capture_output=True, text=True, check=True,
         )
         w, h = map(int, out.stdout.strip().split(","))
-        return h > w
+        return w, h
     except Exception:
-        return False
+        return 0, 0
+
+
+def is_portrait_source(video: Path) -> bool:
+    """Return True if the video's height > width (portrait / vertical)."""
+    w, h = get_video_dimensions(video)
+    return h > w
+
+
+def find_subject_x(
+    video: Path,
+    seg_start: float,
+    seg_end: float,
+    scaled_w: int,
+    crop_w: int,
+    n_samples: int = 5,
+) -> int:
+    """Estimate the best horizontal crop offset for a vertical reframe.
+
+    Samples n_samples frames from the segment at 320px wide, computes the
+    horizontal gradient-energy centroid (where the subject is sharpest/most
+    detailed), then maps that back to post-scale coordinates to return the
+    crop x offset for `crop={crop_w}:{crop_h}:{x}:0`.
+
+    Falls back to centre crop if frame extraction or analysis fails.
+    """
+    import tempfile
+    import numpy as np
+    from PIL import Image
+
+    centre_x = (scaled_w - crop_w) // 2
+    centre_x -= centre_x % 2  # round to even
+
+    duration = seg_end - seg_start
+    if duration <= 0:
+        return centre_x
+
+    # Sample evenly, skipping the outer 10% to avoid black leader / cut flash
+    margin = min(0.1 * duration, 0.5)
+    sample_times = [
+        seg_start + margin + (duration - 2 * margin) * i / max(1, n_samples - 1)
+        for i in range(n_samples)
+    ]
+
+    cx_values: list[float] = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for i, t in enumerate(sample_times):
+            frame_path = Path(tmpdir) / f"f{i:02d}.png"
+            try:
+                subprocess.run(
+                    ["ffmpeg", "-y", "-ss", f"{t:.3f}", "-i", str(video),
+                     "-frames:v", "1", "-vf", "scale=320:-2",
+                     "-f", "image2", str(frame_path)],
+                    check=True, capture_output=True,
+                )
+                arr = np.array(Image.open(frame_path).convert("L"), dtype=np.float32)
+                grad = np.abs(np.diff(arr, axis=1))
+                energy = grad.sum(axis=0)
+                total = float(energy.sum())
+                if total < 1.0:
+                    continue
+                xs = np.arange(len(energy), dtype=np.float32)
+                cx_small = float(np.dot(energy, xs) / total)
+                # Scale from 320-px space to post-scale coordinates
+                cx_values.append(cx_small * (scaled_w / 320.0))
+            except Exception:
+                continue
+
+    if not cx_values:
+        return centre_x
+
+    cx = sum(cx_values) / len(cx_values)
+    x = int(cx - crop_w / 2)
+    x = max(0, min(x, scaled_w - crop_w))
+    x -= x % 2  # H.264 requires even dimensions
+    return x
 
 
 # -------- Per-segment extraction (Rule 2 + Rule 3) --------------------------
@@ -179,13 +254,18 @@ def extract_segment(
 
     if vertical and not portrait:
         # Landscape → 9:16: scale to target height (making it wider than needed),
-        # then centre-crop to the target width. Default crop x centres automatically.
+        # then subject-tracking crop to the target width.
+        src_w, src_h = get_video_dimensions(source)
         if draft:
-            scale = "scale=-2:1280"
-            crop = "crop=720:1280"
+            scale_h, crop_w, crop_h = 1280, 720, 1280
         else:
-            scale = "scale=-2:1920"
-            crop = "crop=1080:1920"
+            scale_h, crop_w, crop_h = 1920, 1080, 1920
+        scale = f"scale=-2:{scale_h}"
+        # Compute scaled width (even), then find subject x via gradient energy
+        scaled_w = int(src_w * scale_h / src_h)
+        scaled_w -= scaled_w % 2
+        x = find_subject_x(source, seg_start, seg_start + duration, scaled_w, crop_w)
+        crop = f"crop={crop_w}:{crop_h}:{x}:0"
     else:
         # Normal horizontal output (or portrait source staying portrait).
         if draft:
