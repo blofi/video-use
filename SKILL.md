@@ -76,7 +76,7 @@ Helpers (`helpers/transcribe.py`, `helpers/render.py`, etc.) live alongside this
 - **`pack_transcripts.py --edit-dir <dir>`** — `transcripts/*.json` → `takes_packed.md` (phrase-level, break on silence ≥ 0.5s).
 - **`timeline_view.py <video> <start> <end>`** — filmstrip + waveform PNG. On-demand visual drill-down. **Not a scan tool** — use it at decision points, not constantly.
 - **`render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST. `--preview` for 720p fast. `--build-subtitles` to generate master.srt inline. `--vertical` for 9:16 1080×1920 output (landscape sources subject-tracked then cropped; clips land in `clips_graded_vertical/` so both cuts coexist).
-- **`export_resolve.py <edl.json>`** — shot clips with handles + FCPXML 1.9 + CMX 3600 EDL, all zipped as `resolve_package.zip`. `--handles N` (default 2.0s). Import `timeline.fcpxml` into DaVinci Resolve 18+; `timeline.edl` is the CMX 3600 fallback. Shots include trim room so the editor can adjust cuts in Resolve without re-exporting.
+- **`export_resolve.py <edl.json>`** — ProRes 422 HQ shot clips (trimmed, with handles) + FCPXML 1.9 + CMX 3600 EDL in a single `resolve_shots/` folder. `--handles N` (default 25 frames). Import `timeline.fcpxml` into DaVinci Resolve 18+; `timeline.edl` is the CMX 3600 fallback. Add `--zip` to also produce `resolve_package.zip` for transport.
 - **`grade.py <in> -o <out>`** — ffmpeg filter chain grade. Presets + `--filter '<raw>'` for custom.
 
 For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a sub-agent via the `Agent` tool.
