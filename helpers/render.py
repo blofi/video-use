@@ -157,11 +157,16 @@ def extract_segment(
     out_path: Path,
     preview: bool = False,
     draft: bool = False,
+    vertical: bool = False,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
     `-ss` before `-i` for fast accurate seeking. Scale to 1080p from 4K.
     Portrait sources (height > width) are scaled by height to preserve orientation.
+
+    With vertical=True, output is 1080×1920 (9:16) — landscape sources are scaled
+    to height 1920 then centre-cropped to 1080 wide. Portrait sources are already
+    the right orientation and just scale normally to 1080×1920.
 
     Quality ladder:
       - final (default): 1080p libx264 fast CRF 20
@@ -171,15 +176,30 @@ def extract_segment(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     portrait = is_portrait_source(source)
-    if draft:
-        scale = "scale=-2:1280" if portrait else "scale=1280:-2"
+
+    if vertical and not portrait:
+        # Landscape → 9:16: scale to target height (making it wider than needed),
+        # then centre-crop to the target width. Default crop x centres automatically.
+        if draft:
+            scale = "scale=-2:1280"
+            crop = "crop=720:1280"
+        else:
+            scale = "scale=-2:1920"
+            crop = "crop=1080:1920"
     else:
-        scale = "scale=-2:1920" if portrait else "scale=1920:-2"
+        # Normal horizontal output (or portrait source staying portrait).
+        if draft:
+            scale = "scale=-2:1280" if portrait else "scale=1280:-2"
+        else:
+            scale = "scale=-2:1920" if portrait else "scale=1920:-2"
+        crop = ""
 
     vf_parts: list[str] = []
     if is_hdr_source(source):
         vf_parts.append(TONEMAP_CHAIN)
     vf_parts.append(scale)
+    if crop:
+        vf_parts.append(crop)
     if grade_filter:
         vf_parts.append(grade_filter)
     vf = ",".join(vf_parts)
@@ -216,6 +236,7 @@ def extract_all_segments(
     edit_dir: Path,
     preview: bool,
     draft: bool = False,
+    vertical: bool = False,
 ) -> list[Path]:
     """Extract every EDL range into edit_dir/clips_graded/seg_NN.mp4.
     Returns the ordered list of segment paths.
@@ -226,8 +247,9 @@ def extract_all_segments(
     """
     resolved = resolve_grade_filter(edl.get("grade"))
     is_auto = resolved == "__AUTO__"
+    suffix = "_vertical" if vertical else ""
     clips_dir = edit_dir / (
-        "clips_draft" if draft else ("clips_preview" if preview else "clips_graded")
+        f"clips_draft{suffix}" if draft else (f"clips_preview{suffix}" if preview else f"clips_graded{suffix}")
     )
     clips_dir.mkdir(parents=True, exist_ok=True)
 
@@ -255,7 +277,7 @@ def extract_all_segments(
         print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
-        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft)
+        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft, vertical=vertical)
         seg_paths.append(out_path)
 
     return seg_paths
@@ -601,6 +623,16 @@ def main() -> None:
         action="store_true",
         help="Skip audio loudness normalization. Default is on (-14 LUFS, -1 dBTP, LRA 11).",
     )
+    ap.add_argument(
+        "--vertical",
+        action="store_true",
+        help=(
+            "Output 9:16 vertical video (1080×1920) for Reels / TikTok / Shorts. "
+            "Landscape sources are scaled to height 1920 then centre-cropped to 1080 wide. "
+            "Portrait sources are left as-is. Clips land in clips_graded_vertical/ "
+            "so horizontal and vertical renders can coexist in the same edit dir."
+        ),
+    )
     args = ap.parse_args()
 
     edl_path = args.edl.resolve()
@@ -613,16 +645,17 @@ def main() -> None:
 
     # 1. Extract per-segment (auto-grade per range if EDL grade is "auto")
     segment_paths = extract_all_segments(
-        edl, edit_dir, preview=args.preview, draft=args.draft
+        edl, edit_dir, preview=args.preview, draft=args.draft, vertical=args.vertical
     )
 
     # 2. Concat → base
+    v_suffix = "_vertical" if args.vertical else ""
     if args.draft:
-        base_name = "base_draft.mp4"
+        base_name = f"base_draft{v_suffix}.mp4"
     elif args.preview:
-        base_name = "base_preview.mp4"
+        base_name = f"base_preview{v_suffix}.mp4"
     else:
-        base_name = "base.mp4"
+        base_name = f"base{v_suffix}.mp4"
     base_path = edit_dir / base_name
     concat_segments(segment_paths, base_path, edit_dir)
 
