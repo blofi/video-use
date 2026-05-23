@@ -118,10 +118,12 @@ def extract_shot_with_handles(
 # -------- OTIO generation -----------------------------------------------------
 #
 # Coordinate system (Resolve-verified; see extract_clips.py for full bug notes):
-#   available_range.start_time = floor(h_in * fps)          ← matches .mov embedded TC
+#   available_range.start_time = tc_offset + floor(h_in * fps)          ← matches .mov embedded TC
 #   available_range.duration   = floor((h_out - h_in) * fps)
-#   source_range.start_time    = floor(seg_start * fps)      ← absolute in source TC
+#   source_range.start_time    = tc_offset + floor(seg_start * fps)      ← absolute in source TC
 #   source_range.duration      = floor(cut_duration * fps)
+#
+# tc_offset = round(fps) * 3600  (= 01:00:00:00; broadcast MXF source TC default)
 
 
 def write_otio(shots: list[dict], fps: float, out_path: Path) -> None:
@@ -131,6 +133,8 @@ def write_otio(shots: list[dict], fps: float, out_path: Path) -> None:
     h_in (float), h_out (float).
     """
     rate = fps
+    tc_offset = round(fps) * 3600   # 01:00:00:00 — broadcast MXF source TC default
+
     video_track = otio.schema.Track(name="V1", kind=otio.schema.TrackKind.Video)
     audio_track = otio.schema.Track(name="A1", kind=otio.schema.TrackKind.Audio)
 
@@ -139,7 +143,7 @@ def write_otio(shots: list[dict], fps: float, out_path: Path) -> None:
             media_ref = otio.schema.ExternalReference(
                 target_url=shot["file"].resolve().as_uri(),
                 available_range=otio.opentime.TimeRange(
-                    start_time=otio.opentime.RationalTime(fr(shot["h_in"], fps), rate),
+                    start_time=otio.opentime.RationalTime(tc_offset + fr(shot["h_in"], fps), rate),
                     duration=otio.opentime.RationalTime(fr(shot["h_out"] - shot["h_in"], fps), rate),
                 ),
             )
@@ -147,7 +151,7 @@ def write_otio(shots: list[dict], fps: float, out_path: Path) -> None:
                 name=shot["file"].stem,
                 media_reference=media_ref,
                 source_range=otio.opentime.TimeRange(
-                    start_time=otio.opentime.RationalTime(fr(shot["seg_start"], fps), rate),
+                    start_time=otio.opentime.RationalTime(tc_offset + fr(shot["seg_start"], fps), rate),
                     duration=otio.opentime.RationalTime(fr(shot["cut_duration"], fps), rate),
                 ),
             )

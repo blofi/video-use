@@ -94,7 +94,7 @@ def extract_clip(
     """
     h_in  = max(0.0,         edit_in  - handle_s)
     h_out = min(src_duration, edit_out + handle_s)
-    tc    = secs_to_tc(h_in, fps)
+    tc    = secs_to_tc(3600.0 + h_in, fps)   # 01:00:00:00 base + offset (broadcast MXF source TC)
 
     vf_filters = ["yadif=mode=0:parity=0:deint=0"] if deinterlace else []
     vf_args = (["-vf", ",".join(vf_filters)] if vf_filters else [])
@@ -137,10 +137,12 @@ def extract_clip(
 #            finds no overlap, and does not place the clip's picture on the timeline.
 #
 # Correct coordinate system (all values in absolute source TC space):
-#   available_range.start_time = floor(h_in * fps)         ← matches .mov embedded TC
-#   available_range.duration   = floor((h_out-h_in) * fps) ← total .mov length
-#   source_range.start_time    = floor(edit_in * fps)       ← absolute in source
+#   available_range.start_time = tc_offset + floor(h_in * fps)         ← matches .mov embedded TC
+#   available_range.duration   = floor((h_out-h_in) * fps)              ← total .mov length
+#   source_range.start_time    = tc_offset + floor(edit_in * fps)       ← absolute in source
 #   source_range.duration      = floor((edit_out-edit_in) * fps)
+#
+# tc_offset = round(fps) * 3600  (= 01:00:00:00 in frames; broadcast MXF default source TC)
 
 
 def make_otio_clip(
@@ -151,12 +153,13 @@ def make_otio_clip(
     h_in: float,
     h_out: float,
     fps: float,
+    tc_offset_frames: int = 0,
 ) -> otio.schema.Clip:
     rate = fps
     media_ref = otio.schema.ExternalReference(
         target_url=file.resolve().as_uri(),
         available_range=otio.opentime.TimeRange(
-            start_time=otio.opentime.RationalTime(fr(h_in, fps), rate),
+            start_time=otio.opentime.RationalTime(tc_offset_frames + fr(h_in, fps), rate),
             duration=otio.opentime.RationalTime(fr(h_out - h_in, fps), rate),
         ),
     )
@@ -164,20 +167,21 @@ def make_otio_clip(
         name=name,
         media_reference=media_ref,
         source_range=otio.opentime.TimeRange(
-            start_time=otio.opentime.RationalTime(fr(edit_in, fps), rate),
+            start_time=otio.opentime.RationalTime(tc_offset_frames + fr(edit_in, fps), rate),
             duration=otio.opentime.RationalTime(fr(edit_out - edit_in, fps), rate),
         ),
     )
 
 
 def write_otio(clips_data: list[dict], fps: float, timeline_name: str, out_path: Path) -> None:
-    """Write an OTIO file with separate video and audio tracks (both referencing the same clips)."""
+    tc_offset_frames = round(fps) * 3600   # 01:00:00:00 — broadcast MXF source TC default
+
     video_track = otio.schema.Track(name="V1", kind=otio.schema.TrackKind.Video)
     audio_track = otio.schema.Track(name="A1", kind=otio.schema.TrackKind.Audio)
 
     for d in clips_data:
-        clip_v = make_otio_clip(**d, fps=fps)
-        clip_a = make_otio_clip(**d, fps=fps)
+        clip_v = make_otio_clip(**d, fps=fps, tc_offset_frames=tc_offset_frames)
+        clip_a = make_otio_clip(**d, fps=fps, tc_offset_frames=tc_offset_frames)
         video_track.append(clip_v)
         audio_track.append(clip_a)
 
