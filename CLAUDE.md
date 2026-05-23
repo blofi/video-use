@@ -43,7 +43,7 @@ All helpers live in `helpers/` and are invoked as `python helpers/<name>.py`:
 | `timeline_view.py` | Generates filmstrip + waveform + word-label PNG for a time range |
 | `render.py` | Final renderer: extract → concat → overlay → subtitles. Flags: `--preview`, `--build-subtitles`, `--no-subtitles`, `--vertical` |
 | `grade.py` | Applies ffmpeg filter chains; presets: `warm_cinematic`, `neutral_punch`, `none`, or `--filter '<raw>'` |
-| `export_resolve.py` | ProRes 422 HQ + FCPXML 1.9 + CMX 3600 EDL for DaVinci Resolve; flags: `--handles N`, `--zip` |
+| `export_resolve.py` | ProRes 422 HQ + OpenTimelineIO `.otio` for any OTIO-compatible NLE; flags: `--handles N`, `--zip` |
 
 ## Editing Pipeline
 
