@@ -43,6 +43,7 @@ All helpers live in `helpers/` and are invoked as `python helpers/<name>.py`:
 | `timeline_view.py` | Generates filmstrip + waveform + word-label PNG for a time range |
 | `render.py` | Final renderer: extract → concat → overlay → subtitles. Flags: `--preview`, `--build-subtitles`, `--no-subtitles`, `--vertical` |
 | `grade.py` | Applies ffmpeg filter chains; presets: `warm_cinematic`, `neutral_punch`, `none`, or `--filter '<raw>'` |
+| `extract_clips.py` | ProRes 422 clips + OTIO timeline for broadcast NLE delivery. Flags: `--handles SECONDS`, `--deinterlace`, `-o output.otio` |
 | `export_resolve.py` | ProRes 422 HQ + OpenTimelineIO `.otio` for any OTIO-compatible NLE; flags: `--handles N`, `--zip` |
 
 ## Editing Pipeline
@@ -94,6 +95,7 @@ edit/
 10. Parallel sub-agents for multiple animations
 11. Strategy confirmation before execution
 12. All session outputs in `<videos_dir>/edit/`
+13. OTIO is the sole interchange format — no EDL, no FCPXML
 
 ## Key Reference Files
 

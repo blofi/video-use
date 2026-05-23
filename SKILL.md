@@ -34,6 +34,69 @@ These are the things where deviation produces silent failures or broken output. 
 
 Everything else in this document is a worked example. Deviate whenever the material calls for it.
 
+## Broadcast MXF sources
+
+MXF packages (MPEG-2 1080i, PCM) are the common delivery format from broadcast cameras and archive. Key differences from consumer formats:
+
+**Multi-stream audio** — MXF often contains multiple audio streams:
+- `0:a:0` = programme mix (correct)
+- `0:a:1` = secondary/archive (may be silent or unrelated)
+
+Always identify the right stream before extracting:
+```bash
+ffmpeg -i <file> -af volumedetect -f null /dev/null
+```
+Always map streams explicitly. Never rely on default selection:
+```
+-map 0:v:0 -map 0:a:0
+```
+
+**Interlaced sources** — deinterlace every extraction from interlaced MXF:
+```
+-vf "yadif=mode=0:parity=0:deint=0"
+```
+
+**`extract_clips.py`** handles both automatically. Pass `--deinterlace` for interlaced sources.
+
+## OTIO correctness (Resolve-verified)
+
+Three silent bugs exist when writing OTIO for DaVinci Resolve. All three are fixed in `extract_clips.py` and `export_resolve.py`. Do not reintroduce them.
+
+**Bug 1 — wrong rate.** Every `RationalTime` must use `rate=FPS` (e.g. 25 for 25fps). Using `rate=24` on a 25fps source causes frame-position drift proportional to distance from zero — late clips drift most.
+
+**Bug 2 — no media_reference.** Without an explicit `ExternalReference` with a `file://` URL, Resolve matches clips by searching for a file whose embedded TC window contains `source_range.start_time`. Adjacent handle clips have overlapping TC windows, so the lookup is ambiguous. Resolve assigns audio to the wrong source file — video may appear correct while audio silently plays from a different clip.
+
+**Bug 3 — available_range.start_time = 0.** Setting `available_range.start_time = 0` tells Resolve the file's TC starts at `00:00:00:00`. But the extracted `.mov` has an embedded TC matching `h_in` (e.g. `00:00:09:06`). Resolve compares the OTIO `available_range` against the file's actual TC, finds no overlap, and does not place the clip's picture on the timeline. Audio is unaffected; video is not placed.
+
+**Correct coordinate system** — all values in absolute source TC space, anchored by the embedded TC of each `.mov`:
+```
+available_range.start_time  = floor(h_in * fps)          ← matches .mov embedded TC
+available_range.duration    = floor((h_out - h_in) * fps)
+source_range.start_time     = floor(edit_in * fps)        ← absolute position in source
+source_range.duration       = floor((edit_out - edit_in) * fps)
+```
+Use `math.floor`, not `round`. Use separate video and audio tracks referencing the same clips.
+
+**OTIO is the sole interchange format.** No EDL, no FCPXML.
+
+## Broadcast editorial conventions
+
+These are standing requirements for broadcast news package editing:
+
+1. **Use original voiceover** — no AI voice replacement.
+2. **Remove presenter read-in in vision** (studio presenter introducing the story):
+   - Check the first 10s with `timeline_view`; look for a studio shot.
+   - Many packages open on b-roll — read-in removal is a no-op.
+3. **Do not cut during a lower third**:
+   - In broadcast packages, lower thirds are playout graphics (not burned in). Verify with:
+     ```bash
+     ffmpeg -ss <t> -i <src> -vframes 1 -vf "crop=iw:ih/3:0:ih*2/3" frame.jpg
+     ```
+   - Crop the bottom third at SOT+2s and inspect for graphic artifacts.
+4. **Retain reporter voiceover** where it helps tell the story.
+5. **Retain reporter piece-to-camera (PTC)** — mandatory; never cut a PTC.
+6. **Duration is a proportional guide**: a 2:30 source → ~1:10 guide, but PTC retention takes priority over hitting the number exactly.
+
 ## Directory layout
 
 The skill lives in `video-use/`. User footage lives wherever they put it. All session outputs go into `<videos_dir>/edit/`.
@@ -76,7 +139,8 @@ Helpers (`helpers/transcribe.py`, `helpers/render.py`, etc.) live alongside this
 - **`pack_transcripts.py --edit-dir <dir>`** — `transcripts/*.json` → `takes_packed.md` (phrase-level, break on silence ≥ 0.5s).
 - **`timeline_view.py <video> <start> <end>`** — filmstrip + waveform PNG. On-demand visual drill-down. **Not a scan tool** — use it at decision points, not constantly.
 - **`render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST. `--preview` for 720p fast. `--build-subtitles` to generate master.srt inline. `--vertical` for 9:16 1080×1920 output (landscape sources subject-tracked then cropped; clips land in `clips_graded_vertical/` so both cuts coexist).
-- **`export_resolve.py <edl.json>`** — ProRes 422 HQ shot clips (trimmed, with handles) + OpenTimelineIO `timeline.otio` in a single `resolve_shots/` folder. `--handles N` (default 25 frames). Import `timeline.otio` into any OTIO-compatible NLE (DaVinci Resolve 18+, Final Cut Pro, Premiere Pro). Add `--zip` to also produce `resolve_package.zip` for transport.
+- **`extract_clips.py <edl.json>`** — ProRes 422 clips with handles + correct OTIO timeline. Primary helper for broadcast NLE deliver. `--handles SECONDS` (default 1.0s = 25 frames at 25fps). `--deinterlace` for interlaced MXF. Explicit stream mapping (0:v:0, 0:a:0), embedded source TC, correct absolute-TC OTIO coordinate system. Clips go to `<edit>/clips/`; OTIO to `<edit>/timeline.otio`.
+- **`export_resolve.py <edl.json>`** — ProRes 422 HQ shot clips (trimmed, with handles) + OpenTimelineIO `timeline.otio` in a single `resolve_shots/` folder. `--handles N` (default 25 frames). Add `--zip` to produce `resolve_package.zip` for transport.
 - **`grade.py <in> -o <out>`** — ffmpeg filter chain grade. Presets + `--filter '<raw>'` for custom.
 
 For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a sub-agent via the `Agent` tool.

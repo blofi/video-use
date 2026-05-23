@@ -2,7 +2,7 @@
 
 Produces a folder (or zip) containing:
   resolve_shots/
-    shot_01_<source>.mov  ← ProRes 422 HQ extract with handles
+    shot_01_<source>.mov  ← ProRes 422 HQ extract with handles + embedded TC
     shot_02_<source>.mov
     ...
     timeline.otio          ← import into any OTIO-compatible NLE
@@ -10,7 +10,7 @@ Produces a folder (or zip) containing:
 
 Usage:
     python helpers/export_resolve.py edit/edl.json
-    python helpers/export_resolve.py edit/edl.json --handles 2.0
+    python helpers/export_resolve.py edit/edl.json --handles 25
     python helpers/export_resolve.py edit/edl.json -o edit/package.zip
 """
 
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 import zipfile
@@ -57,6 +58,20 @@ def resolve_path(maybe_path: str, base: Path) -> Path:
     return (base / p).resolve()
 
 
+def secs_to_tc(s: float, fps: float) -> str:
+    fps_int = round(fps)
+    total = int(math.floor(s * fps))
+    fr = total % fps_int
+    sc = (total // fps_int) % 60
+    mn = (total // fps_int // 60) % 60
+    hr = total // fps_int // 3600
+    return f"{hr:02d}:{mn:02d}:{sc:02d}:{fr:02d}"
+
+
+def fr(s: float, fps: float) -> int:
+    return int(math.floor(s * fps))
+
+
 # -------- Shot extraction -----------------------------------------------------
 
 
@@ -67,68 +82,80 @@ def extract_shot_with_handles(
     handle_frames: int,
     fps: float,
     src_duration: float,
+    shot_name: str,
     out_path: Path,
 ) -> tuple[float, float]:
-    """Extract a ProRes 422 HQ shot with frame-accurate handles.
+    """Extract a ProRes 422 HQ shot with handles and embedded source TC.
 
-    Returns (actual_pre_s, actual_post_s) — may be shorter near source boundaries.
+    Returns (actual_h_in, actual_h_out) in source seconds.
+    Explicit stream mapping ensures the correct audio stream is selected from
+    multi-stream sources (e.g. broadcast MXF with programme mix on 0:a:0).
     """
     handle_s = handle_frames / fps
-    pre = min(handle_s, seg_start)
-    post = min(handle_s, max(0.0, src_duration - seg_end))
-    start = seg_start - pre
-    duration = (seg_end - seg_start) + pre + post
+    h_in  = max(0.0,         seg_start - handle_s)
+    h_out = min(src_duration, seg_end   + handle_s)
+    tc    = secs_to_tc(h_in, fps)
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         "ffmpeg", "-y",
-        "-ss", f"{start:.6f}",
+        "-ss", f"{h_in:.6f}",
         "-i", str(source),
-        "-t", f"{duration:.6f}",
+        "-t", f"{h_out - h_in:.6f}",
+        "-map", "0:v:0", "-map", "0:a:0",
         "-c:v", "prores_ks", "-profile:v", "3",  # ProRes 422 HQ
         "-pix_fmt", "yuv422p10le",
-        "-c:a", "pcm_s24le",
-        "-ar", "48000",
+        "-c:a", "pcm_s24le", "-ar", "48000",
+        "-timecode", tc,
+        "-metadata", f"reel_name={shot_name}",
+        "-metadata", f"tape_name={shot_name}",
         str(out_path),
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    return pre, post
+    return h_in, h_out
 
 
 # -------- OTIO generation -----------------------------------------------------
+#
+# Coordinate system (Resolve-verified; see extract_clips.py for full bug notes):
+#   available_range.start_time = floor(h_in * fps)          ← matches .mov embedded TC
+#   available_range.duration   = floor((h_out - h_in) * fps)
+#   source_range.start_time    = floor(seg_start * fps)      ← absolute in source TC
+#   source_range.duration      = floor(cut_duration * fps)
 
 
 def write_otio(shots: list[dict], fps: float, out_path: Path) -> None:
-    """Write an OpenTimelineIO .otio file referencing the handle-clipped shot files.
+    """Write an OTIO file with video and audio tracks.
 
-    Each shot dict must have: file (Path), pre_handle (float), post_handle (float),
-    cut_duration (float), timeline_offset (float).
-
-    source_range trims into the handle clip so the editor has room to extend cuts.
+    Each shot dict must have: file (Path), seg_start (float), cut_duration (float),
+    h_in (float), h_out (float).
     """
     rate = fps
     video_track = otio.schema.Track(name="V1", kind=otio.schema.TrackKind.Video)
+    audio_track = otio.schema.Track(name="A1", kind=otio.schema.TrackKind.Audio)
 
-    for i, shot in enumerate(shots):
-        total_duration_s = shot["pre_handle"] + shot["cut_duration"] + shot["post_handle"]
-        media_ref = otio.schema.ExternalReference(
-            target_url=shot["file"].resolve().as_uri(),
-            available_range=otio.opentime.TimeRange(
-                start_time=otio.opentime.RationalTime(0, rate),
-                duration=otio.opentime.RationalTime(round(total_duration_s * rate), rate),
-            ),
-        )
-        clip = otio.schema.Clip(
-            name=shot["file"].stem,
-            media_reference=media_ref,
-            source_range=otio.opentime.TimeRange(
-                start_time=otio.opentime.RationalTime(round(shot["pre_handle"] * rate), rate),
-                duration=otio.opentime.RationalTime(round(shot["cut_duration"] * rate), rate),
-            ),
-        )
-        video_track.append(clip)
+    for shot in shots:
+        for track in (video_track, audio_track):
+            media_ref = otio.schema.ExternalReference(
+                target_url=shot["file"].resolve().as_uri(),
+                available_range=otio.opentime.TimeRange(
+                    start_time=otio.opentime.RationalTime(fr(shot["h_in"], fps), rate),
+                    duration=otio.opentime.RationalTime(fr(shot["h_out"] - shot["h_in"], fps), rate),
+                ),
+            )
+            clip = otio.schema.Clip(
+                name=shot["file"].stem,
+                media_reference=media_ref,
+                source_range=otio.opentime.TimeRange(
+                    start_time=otio.opentime.RationalTime(fr(shot["seg_start"], fps), rate),
+                    duration=otio.opentime.RationalTime(fr(shot["cut_duration"], fps), rate),
+                ),
+            )
+            track.append(clip)
 
     timeline = otio.schema.Timeline(name="video-use export")
     timeline.tracks.append(video_track)
+    timeline.tracks.append(audio_track)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     otio.adapters.write_to_file(timeline, str(out_path))
@@ -181,15 +208,13 @@ def build_package(
     ranges = edl["ranges"]
 
     src_meta: dict[str, dict] = {}
-    for src_rel in sources.values():
+    for src_key, src_rel in sources.items():
         src_path = resolve_path(src_rel, edit_dir)
-        if str(src_path) not in src_meta:
-            fps = fps_override or detect_fps(src_path)
-            dur = detect_duration(src_path)
-            src_meta[str(src_path)] = {"fps": fps, "duration": dur}
+        fps = fps_override or detect_fps(src_path)
+        dur = detect_duration(src_path)
+        src_meta[src_key] = {"path": src_path, "fps": fps, "duration": dur}
 
-    first_src = resolve_path(next(iter(sources.values())), edit_dir)
-    fps = src_meta[str(first_src)]["fps"]
+    fps = src_meta[next(iter(sources))]["fps"]
 
     shots: list[dict] = []
     timeline_offset = 0.0
@@ -197,25 +222,27 @@ def build_package(
     print(f"extracting {len(ranges)} shot(s) — ProRes 422 HQ, {handle_frames}-frame handles → resolve_shots/")
     for i, r in enumerate(ranges):
         src_name = r["source"]
-        src_path = resolve_path(sources[src_name], edit_dir)
-        meta = src_meta[str(src_path)]
+        meta = src_meta[src_name]
+        src_path = meta["path"]
         seg_start = float(r["start"])
         seg_end = float(r["end"])
         cut_dur = seg_end - seg_start
         beat = r.get("beat") or r.get("note") or ""
+        shot_name = f"shot_{i + 1:02d}_{src_name}"
 
-        out_name = f"shot_{i + 1:02d}_{src_name}.mov"
-        out_path = shots_dir / out_name
+        out_path = shots_dir / f"{shot_name}.mov"
         print(f"  [{i + 1:02d}] {src_name}  {seg_start:.2f}-{seg_end:.2f}  ({cut_dur:.2f}s)  {beat}")
 
-        pre, post = extract_shot_with_handles(
-            src_path, seg_start, seg_end, handle_frames, meta["fps"], meta["duration"], out_path
+        h_in, h_out = extract_shot_with_handles(
+            src_path, seg_start, seg_end, handle_frames, meta["fps"], meta["duration"],
+            shot_name, out_path,
         )
         shots.append({
             "file": out_path,
-            "pre_handle": pre,
-            "post_handle": post,
+            "seg_start": seg_start,
             "cut_duration": cut_dur,
+            "h_in": h_in,
+            "h_out": h_out,
             "timeline_offset": timeline_offset,
         })
         timeline_offset += cut_dur
