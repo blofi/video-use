@@ -233,6 +233,7 @@ def extract_segment(
     preview: bool = False,
     draft: bool = False,
     vertical: bool = False,
+    audio_streams: int = 1,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
@@ -286,7 +287,7 @@ def extract_segment(
 
     # 30ms audio fades at both edges (Rule 3) — prevent pops
     fade_out_start = max(0.0, duration - 0.03)
-    af = f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_start:.3f}:d=0.03"
+    afade = f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_start:.3f}:d=0.03"
 
     if draft:
         preset, crf = "ultrafast", "28"
@@ -295,13 +296,26 @@ def extract_segment(
     else:
         preset, crf = "fast", "20"
 
+    # When mixing multiple audio streams (e.g. broadcast MXF with VO on ch1 and
+    # NAT/SOT on ch2) use filter_complex for audio so amix and afade chain together.
+    # -vf and -filter_complex can coexist as long as filter_complex outputs audio only.
+    if audio_streams > 1:
+        inputs = "".join(f"[0:a:{i}]" for i in range(audio_streams))
+        fc_audio = (
+            f"{inputs}amix=inputs={audio_streams}:duration=first:dropout_transition=0,"
+            f"{afade}[aout]"
+        )
+        audio_args = ["-filter_complex", fc_audio, "-map", "0:v:0", "-map", "[aout]"]
+    else:
+        audio_args = ["-af", afade]
+
     cmd = [
         "ffmpeg", "-y",
         "-ss", f"{seg_start:.3f}",
         "-i", str(source),
         "-t", f"{duration:.3f}",
         "-vf", vf,
-        "-af", af,
+        *audio_args,
         "-c:v", "libx264", "-preset", preset, "-crf", crf,
         "-pix_fmt", "yuv420p", "-r", "24",
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
@@ -317,6 +331,7 @@ def extract_all_segments(
     preview: bool,
     draft: bool = False,
     vertical: bool = False,
+    audio_streams: int = 1,
 ) -> list[Path]:
     """Extract every EDL range into edit_dir/clips_graded/seg_NN.mp4.
     Returns the ordered list of segment paths.
@@ -357,7 +372,7 @@ def extract_all_segments(
         print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
-        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft, vertical=vertical)
+        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft, vertical=vertical, audio_streams=audio_streams)
         seg_paths.append(out_path)
 
     return seg_paths
@@ -713,6 +728,11 @@ def main() -> None:
             "so horizontal and vertical renders can coexist in the same edit dir."
         ),
     )
+    ap.add_argument(
+        "--audio-streams", type=int, default=1, metavar="N",
+        help="Number of audio streams to amix together (default: 1). "
+             "Use 2 for broadcast Avid MXF packages where VO is on ch1 and NAT/SOT is on ch2.",
+    )
     args = ap.parse_args()
 
     edl_path = args.edl.resolve()
@@ -725,7 +745,8 @@ def main() -> None:
 
     # 1. Extract per-segment (auto-grade per range if EDL grade is "auto")
     segment_paths = extract_all_segments(
-        edl, edit_dir, preview=args.preview, draft=args.draft, vertical=args.vertical
+        edl, edit_dir, preview=args.preview, draft=args.draft, vertical=args.vertical,
+        audio_streams=args.audio_streams,
     )
 
     # 2. Concat → base

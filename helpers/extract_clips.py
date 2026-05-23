@@ -86,27 +86,56 @@ def extract_clip(
     clip_name: str,
     out_path: Path,
     deinterlace: bool,
+    audio_streams: int = 1,
 ) -> tuple[float, float]:
     """Extract one ProRes 422 clip with handles and embedded source TC.
 
     Returns (actual_h_in, actual_h_out) in source seconds.
     The .mov's embedded TC is set to h_in so OTIO available_range can match it.
+
+    audio_streams: number of source audio streams to mix together.
+      1 (default) → map 0:a:0 directly.
+      N > 1 → amix all N streams into a single mono output.
+      Broadcast Avid MXF news packages split VO and NAT/SOT onto separate
+      tracks — pass audio_streams=2 (or however many are active) to get the
+      complete programme audio.
     """
     h_in  = max(0.0,         edit_in  - handle_s)
     h_out = min(src_duration, edit_out + handle_s)
     tc    = secs_to_tc(3600.0 + h_in, fps)   # 01:00:00:00 base + offset (broadcast MXF source TC)
 
-    vf_filters = ["yadif=mode=0:parity=0:deint=0"] if deinterlace else []
-    vf_args = (["-vf", ",".join(vf_filters)] if vf_filters else [])
-
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    mix_audio = audio_streams > 1
+
+    if deinterlace or mix_audio:
+        # Build filter_complex so video and audio chains can coexist.
+        fc_parts: list[str] = []
+        v_out = "0:v:0"
+        if deinterlace:
+            fc_parts.append("[0:v:0]yadif=mode=0:parity=0:deint=0[vout]")
+            v_out = "[vout]"
+        if mix_audio:
+            inputs = "".join(f"[0:a:{i}]" for i in range(audio_streams))
+            fc_parts.append(
+                f"{inputs}amix=inputs={audio_streams}:duration=first:dropout_transition=0[aout]"
+            )
+            a_out = "[aout]"
+        else:
+            a_out = "0:a:0"
+        fc_args = ["-filter_complex", ";".join(fc_parts)] if fc_parts else []
+        map_args = ["-map", v_out, "-map", a_out]
+    else:
+        fc_args = []
+        map_args = ["-map", "0:v:0", "-map", "0:a:0"]
+
     cmd = [
         "ffmpeg", "-y",
         "-ss", f"{h_in:.6f}",
         "-i", str(source),
         "-t", f"{h_out - h_in:.6f}",
-        *vf_args,
-        "-map", "0:v:0", "-map", "0:a:0",   # explicit: ignores secondary MXF streams
+        *fc_args,
+        *map_args,
         "-c:v", "prores_ks", "-profile:v", "2",   # ProRes 422
         "-pix_fmt", "yuv422p10le",
         "-c:a", "pcm_s24le", "-ar", "48000",
@@ -210,6 +239,7 @@ def run(
     handle_s: float = 1.0,
     fps_override: float | None = None,
     deinterlace: bool = False,
+    audio_streams: int = 1,
     clips_dir_name: str = "clips",
     otio_out: Path | None = None,
     timeline_name: str | None = None,
@@ -239,6 +269,8 @@ def run(
     print(f"extracting {len(ranges)} clip(s) → {clips_dir}/")
     if deinterlace:
         print("  deinterlace: yadif=mode=0:parity=0:deint=0")
+    if audio_streams > 1:
+        print(f"  audio: amix of {audio_streams} streams (0:a:0 … 0:a:{audio_streams - 1})")
 
     clips_data: list[dict] = []
 
@@ -265,6 +297,7 @@ def run(
             clip_name=name,
             out_path=out_path,
             deinterlace=deinterlace,
+            audio_streams=audio_streams,
         )
         clips_data.append({
             "name":    name,
@@ -308,6 +341,11 @@ def main() -> None:
         help="Apply yadif deinterlacing (use for interlaced MXF sources)",
     )
     ap.add_argument(
+        "--audio-streams", type=int, default=1, metavar="N",
+        help="Number of audio streams to amix together (default: 1). "
+             "Use 2 for broadcast Avid MXF packages where VO is on ch1 and NAT/SOT is on ch2.",
+    )
+    ap.add_argument(
         "--clips-dir", default="clips", metavar="DIR",
         help="Subdirectory under edit dir for extracted clips (default: clips)",
     )
@@ -332,6 +370,7 @@ def main() -> None:
         handle_s=args.handles,
         fps_override=args.fps,
         deinterlace=args.deinterlace,
+        audio_streams=args.audio_streams,
         clips_dir_name=args.clips_dir,
         otio_out=otio_out,
         timeline_name=args.name,

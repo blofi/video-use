@@ -38,18 +38,22 @@ Everything else in this document is a worked example. Deviate whenever the mater
 
 MXF packages (MPEG-2 1080i, PCM) are the common delivery format from broadcast cameras and archive. Key differences from consumer formats:
 
-**Multi-stream audio** — MXF often contains multiple audio streams:
-- `0:a:0` = programme mix (correct)
-- `0:a:1` = secondary/archive (may be silent or unrelated)
+**Multi-stream audio** — Broadcast Avid MXF news packages split audio across tracks: reporter VO on one channel, natural sound / SOT audio on another. Neither channel alone is the complete mix. Always identify all active streams and mix them together.
 
-Always identify the right stream before extracting:
+Step 1 — find active streams (n_samples > 0, mean > -60 dB):
 ```bash
-ffmpeg -i <file> -af volumedetect -f null /dev/null
+ffmpeg -i <file> -map 0:a:0 -af volumedetect -f null /dev/null 2>&1
+ffmpeg -i <file> -map 0:a:1 -af volumedetect -f null /dev/null 2>&1
+# repeat for each audio stream
 ```
-Always map streams explicitly. Never rely on default selection:
+
+Step 2 — mix all active streams with `amix`. For two active streams:
 ```
--map 0:v:0 -map 0:a:0
+-filter_complex "[0:a:0][0:a:1]amix=inputs=2:duration=first:dropout_transition=0[aout]" \
+-map 0:v:0 -map [aout]
 ```
+
+Never pick just one stream based on volume level — different levels indicate different content (VO vs NAT/SOT), not that one stream is wrong. Do not assume `0:a:0` is the programme mix.
 
 **Interlaced sources** — deinterlace every extraction from interlaced MXF:
 ```
