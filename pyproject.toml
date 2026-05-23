@@ -10,6 +10,7 @@ dependencies = [
     "matplotlib",
     "pillow",
     "numpy",
+    "opentimelineio",
 ]
 
 [project.optional-dependencies]
