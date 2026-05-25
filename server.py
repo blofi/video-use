@@ -292,12 +292,20 @@ async def _run_tool(name: str, tool_input: dict, ws: WebSocket) -> str:
         return "No transcript found. Call run_transcribe first."
     if name == "write_edl":
         edl = tool_input["edl"]
+        # Always recompute — don't trust the LLM's arithmetic
+        edl["total_duration_s"] = round(
+            sum(float(r["end"]) - float(r["start"]) for r in edl.get("ranges", [])), 3
+        )
         EDIT_DIR.mkdir(parents=True, exist_ok=True)
         edl_path = EDIT_DIR / "edl.json"
         async with aiofiles.open(edl_path, "w") as f:
             await f.write(json.dumps(edl, indent=2))
         n = len(edl.get("ranges", []))
-        return f"EDL written ({n} segment{'s' if n != 1 else ''}). Call render_preview to see the cut."
+        return (
+            f"EDL written ({n} segment{'s' if n != 1 else ''}, "
+            f"total duration {edl['total_duration_s']}s). "
+            "Call render_preview to see the cut."
+        )
 
     if name in ("render_preview", "render_final"):
         edl_path = EDIT_DIR / "edl.json"
