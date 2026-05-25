@@ -342,6 +342,16 @@ TOOLS = [
         "input_schema": {"type": "object", "properties": {}},
     },
     {
+        "name": "render_vertical",
+        "description": (
+            "Render a 1080×1920 (9:16) vertical MP4 from the current edl.json. "
+            "Use this when the user wants a vertical/portrait version for social media. "
+            "Honours x_crop values set on each range; falls back to auto subject-tracking if absent. "
+            "Output: edit/vertical.mp4."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "run_transcribe",
         "description": "Transcribe all video files in the project directory then pack into takes_packed.md. Run this first when no transcript exists.",
         "input_schema": {"type": "object", "properties": {}},
@@ -390,16 +400,20 @@ async def _run_tool(name: str, tool_input: dict, ws: WebSocket) -> str:
             "Call render_preview to see the cut."
         )
 
-    if name in ("render_preview", "render_final"):
+    if name in ("render_preview", "render_final", "render_vertical"):
         edl_path = EDIT_DIR / "edl.json"
         if not edl_path.exists():
             return "Error: edl.json not found. Call write_edl first."
-        mode = "preview" if name == "render_preview" else "final"
-        out_name = "preview.mp4" if mode == "preview" else "final.mp4"
+        if name == "render_preview":
+            out_name, extra_flag = "preview.mp4", "--preview"
+        elif name == "render_vertical":
+            out_name, extra_flag = "vertical.mp4", "--vertical"
+        else:
+            out_name, extra_flag = "final.mp4", None
         out_path = EDIT_DIR / out_name
         cmd = [sys.executable, str(HERE / "helpers" / "render.py"), str(edl_path), "-o", str(out_path)]
-        if mode == "preview":
-            cmd.append("--preview")
+        if extra_flag:
+            cmd.append(extra_flag)
 
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
@@ -412,6 +426,7 @@ async def _run_tool(name: str, tool_input: dict, ws: WebSocket) -> str:
         await proc.wait()
 
         if proc.returncode == 0:
+            mode = name.replace("render_", "")
             await ws.send_json({"type": "render_done", "path": f"edit/{out_name}", "mode": mode})
             return f"{mode.title()} render complete: {out_path}"
         return f"Render failed (exit {proc.returncode}):\n" + "\n".join(lines[-20:])
@@ -495,8 +510,9 @@ def _build_system() -> list[dict]:
         "- The transcript (takes_packed.md) is injected directly into this system prompt below — "
         "you already have it. You do NOT need to read any files to access it.\n"
         "- If for any reason you need to re-read the transcript, use the `read_transcript` tool.\n"
-        "- Your only tools are: write_edl, render_preview, render_final, run_transcribe, "
+        "- Your only tools are: write_edl, render_preview, render_final, render_vertical, run_transcribe, "
         "timeline_view, read_transcript.\n"
+        "- Use render_vertical to produce a 1080×1920 9:16 social-media version; it honours x_crop on each range.\n"
         "- Always confirm the editing strategy in plain English before calling write_edl.\n\n"
         f"Videos directory: {VIDEOS_DIR}\nEdit directory: {EDIT_DIR}\n\n"
     )
