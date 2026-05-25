@@ -961,7 +961,7 @@ function openCropEditor(seg, rangeIndex) {
   cropFrameImg.src = `/api/frame?source=${encodeURIComponent(seg._sourcePath || '')}&t=${t.toFixed(3)}`;
 
   cropModal.classList.add('open');
-  updateCropOverlay();
+  requestAnimationFrame(() => updateCropOverlay());
 }
 
 function updateCropOverlay() {
