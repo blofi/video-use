@@ -85,11 +85,23 @@ def resolve_grade_filter(grade_field: str | None) -> str:
 
 
 def resolve_path(maybe_path: str, base: Path) -> Path:
-    """Resolve a path that may be absolute or relative to `base`."""
+    """Resolve a path that may be absolute or relative to `base`.
+
+    If the resolved path doesn't exist, do a case-insensitive filename search
+    in the same directory so that e.g. `.MXF` is found when the EDL says `.mxf`.
+    """
     p = Path(maybe_path)
-    if p.is_absolute():
-        return p
-    return (base / p).resolve()
+    resolved = p if p.is_absolute() else (base / p).resolve()
+    if resolved.exists():
+        return resolved
+    # Case-insensitive fallback: scan the parent directory
+    parent = resolved.parent
+    name_lower = resolved.name.lower()
+    if parent.is_dir():
+        for candidate in parent.iterdir():
+            if candidate.name.lower() == name_lower:
+                return candidate
+    return resolved  # return original path so ffmpeg error message is meaningful
 
 
 # -------- HDR → SDR tone mapping (HLG / PQ sources) --------------------------

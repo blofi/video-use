@@ -31,6 +31,21 @@ from fastapi.staticfiles import StaticFiles
 HERE = Path(__file__).parent
 STATIC_DIR = HERE / "static"
 
+
+def resolve_source_path(path_str: str) -> Path:
+    """Return a Path for path_str, falling back to a case-insensitive match
+    in the same directory when the exact path doesn't exist (e.g. .MXF vs .mxf)."""
+    p = Path(path_str)
+    if p.exists():
+        return p
+    parent = p.parent
+    name_lower = p.name.lower()
+    if parent.is_dir():
+        for candidate in parent.iterdir():
+            if candidate.name.lower() == name_lower:
+                return candidate
+    return p
+
 SKILL_MD: str = ""
 VIDEOS_DIR: Path = Path(".")
 EDIT_DIR: Path = Path("edit")
@@ -219,7 +234,8 @@ async def api_render(request: Request):
 @app.get("/api/frame")
 async def api_frame(source: str, t: float, request: Request):
     """Extract a single JPEG frame at time t from source for the vertical crop editor."""
-    p = Path(source) if Path(source).is_absolute() else VIDEOS_DIR / source
+    raw = Path(source) if Path(source).is_absolute() else VIDEOS_DIR / source
+    p = resolve_source_path(str(raw))
     if not p.exists() or not p.is_file():
         raise HTTPException(status_code=404, detail="File not found")
     try:
@@ -434,7 +450,7 @@ async def _run_tool(name: str, tool_input: dict, ws: WebSocket) -> str:
         return "Transcription ran but takes_packed.md was not created."
 
     if name == "timeline_view":
-        source = tool_input["source_path"]
+        source = str(resolve_source_path(tool_input["source_path"]))
         start = float(tool_input["start"])
         end = float(tool_input["end"])
         stem = Path(source).stem
