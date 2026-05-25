@@ -358,6 +358,78 @@ body {
 .beat-cta      { background: rgba(107,159,255,0.2); color: #6b9fff; }
 .beat-default  { background: rgba(255,255,255,0.07); color: #9999b0; }
 
+/* crop position indicator on shot blocks */
+.crop-dot {
+  display: inline-block;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: #6b9fff;
+  margin-left: 5px;
+  flex-shrink: 0;
+  vertical-align: middle;
+}
+
+/* crop editor modal */
+#crop-modal {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.88);
+  z-index: 1000;
+  align-items: center;
+  justify-content: center;
+}
+#crop-modal.open { display: flex; }
+#crop-modal-inner {
+  background: #1a1a2e;
+  border: 1px solid #333;
+  border-radius: 10px;
+  padding: 18px;
+  width: min(92vw, 700px);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+#crop-modal-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: #ccc;
+  font-family: var(--mono);
+}
+#crop-frame-wrap {
+  position: relative;
+  width: 100%;
+  /* 16:9 aspect ratio */
+  aspect-ratio: 16 / 9;
+  background: #000;
+  border-radius: 6px;
+  overflow: hidden;
+  cursor: ew-resize;
+  user-select: none;
+}
+#crop-frame-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  pointer-events: none;
+  display: block;
+}
+#crop-overlay {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  /* width set via JS to ~31.6% */
+  background: rgba(107,159,255,0.18);
+  border: 2px solid rgba(107,159,255,0.8);
+  box-sizing: border-box;
+  pointer-events: none;
+}
+#crop-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
 /* modal for full-size timeline PNGs */
 #img-modal {
   display: none;
@@ -383,6 +455,7 @@ body {
     <button class="btn btn-green" id="transcribe-btn" style="display:none">Transcribe footage</button>
     <button class="btn btn-ghost" id="render-preview-btn" disabled>Preview</button>
     <button class="btn btn-blue" id="render-final-btn" disabled>Render Final</button>
+    <button class="btn btn-green" id="render-vertical-btn" disabled>Render Vertical</button>
     <button class="btn btn-accent" id="export-btn" disabled>Export for Resolve</button>
   </div>
 </div>
@@ -422,6 +495,21 @@ body {
 
 </div>
 
+<!-- Vertical crop editor modal -->
+<div id="crop-modal">
+  <div id="crop-modal-inner">
+    <div id="crop-modal-title">Set vertical crop position</div>
+    <div id="crop-frame-wrap">
+      <img id="crop-frame-img" alt="frame" />
+      <div id="crop-overlay"></div>
+    </div>
+    <div id="crop-modal-actions">
+      <button class="btn btn-ghost" id="crop-cancel-btn">Cancel</button>
+      <button class="btn btn-blue" id="crop-set-btn">Set crop</button>
+    </div>
+  </div>
+</div>
+
 <!-- Full-size image modal -->
 <div id="img-modal">
   <img id="modal-img" src="" alt="">
@@ -443,10 +531,20 @@ const player      = document.getElementById('player');
 const playerPlaceholder = document.getElementById('player-placeholder');
 const timelineTrack = document.getElementById('timeline-track');
 const projPathEl  = document.getElementById('proj-path');
-const transcribeBtn    = document.getElementById('transcribe-btn');
-const renderPreviewBtn = document.getElementById('render-preview-btn');
-const renderFinalBtn   = document.getElementById('render-final-btn');
-const exportBtn        = document.getElementById('export-btn');
+const transcribeBtn      = document.getElementById('transcribe-btn');
+const renderPreviewBtn   = document.getElementById('render-preview-btn');
+const renderFinalBtn     = document.getElementById('render-final-btn');
+const renderVerticalBtn  = document.getElementById('render-vertical-btn');
+const exportBtn          = document.getElementById('export-btn');
+
+const cropModal    = document.getElementById('crop-modal');
+const cropFrameImg = document.getElementById('crop-frame-img');
+const cropOverlay  = document.getElementById('crop-overlay');
+const cropFrameWrap= document.getElementById('crop-frame-wrap');
+const cropCancelBtn= document.getElementById('crop-cancel-btn');
+const cropSetBtn   = document.getElementById('crop-set-btn');
+let cropRangeIndex = -1;
+let cropXCrop = 0.5;
 const imgModal         = document.getElementById('img-modal');
 const modalImg         = document.getElementById('modal-img');
 
@@ -587,10 +685,11 @@ function buildTimeline(edl) {
   if (!edl || !edl.ranges || !edl.ranges.length) return;
 
   const ranges = edl.ranges;
+  const sources = edl.sources || {};
   let offset = 0;
   const segments = ranges.map(r => {
     const dur = Math.max(0.1, r.end - r.start);
-    const s = { ...r, duration: dur, outputStart: offset };
+    const s = { ...r, duration: dur, outputStart: offset, _sourcePath: sources[r.source] || '' };
     offset += dur;
     return s;
   });
@@ -612,10 +711,25 @@ function buildTimeline(edl) {
       seg.quote ? `"${seg.quote.slice(0, 60)}…"` : '',
     ].filter(Boolean).join('\n');
     block.textContent = seg.beat || `${seg.source} ${i + 1}`;
-    block.addEventListener('click', () => {
-      player.currentTime = seg.outputStart;
-      if (player.paused) player.play();
+    if (seg.x_crop != null) {
+      const dot = document.createElement('span');
+      dot.className = 'crop-dot';
+      dot.title = `Vertical crop set (${(seg.x_crop * 100).toFixed(0)}%)`;
+      block.appendChild(dot);
+    }
+    block.addEventListener('click', (ev) => {
+      if (ev.shiftKey) {
+        openCropEditor(seg, i);
+      } else {
+        player.currentTime = seg.outputStart;
+        if (player.paused) player.play();
+      }
     });
+    block.title = [
+      (seg.beat || seg.source) + (seg.x_crop != null ? ' [shift-click to adjust crop]' : ' [shift-click to set crop]'),
+      `${seg.start.toFixed(2)}s → ${seg.end.toFixed(2)}s`,
+      seg.quote ? `"${seg.quote.slice(0, 60)}…"` : '',
+    ].filter(Boolean).join('\n');
     timelineTrack.appendChild(block);
   });
 }
@@ -655,6 +769,7 @@ async function loadProject() {
     }
     const hasEdl = !!data.edl;
     renderPreviewBtn.disabled = !hasEdl;
+    renderVerticalBtn.disabled = !hasEdl;
     exportBtn.disabled = !data.final_available;
 
     // Show transcribe button only when clips exist but no transcript yet
@@ -808,6 +923,103 @@ exportBtn.addEventListener('click', async () => {
     exportBtn.disabled = false;
   }
 });
+
+// ── Render Vertical ────────────────────────────────────────────────────────
+renderVerticalBtn.addEventListener('click', async () => {
+  renderVerticalBtn.disabled = true;
+  renderVerticalBtn.textContent = 'Rendering…';
+  try {
+    const res = await fetch('/api/render', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode: 'vertical'}) });
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      const lines = dec.decode(value).split('\n').filter(l => l.startsWith('data:'));
+      for (const line of lines) {
+        const d = JSON.parse(line.slice(5));
+        if (d.status === 'done') { loadVideo(d.path); loadProject(); }
+      }
+    }
+  } finally {
+    renderVerticalBtn.textContent = 'Render Vertical';
+    loadProject();
+  }
+});
+
+// ── Vertical crop editor ───────────────────────────────────────────────────
+// The 9:16 overlay rect width fraction inside a 16:9 container:
+// crop_w_in_source = src_h * 9/16; display_w = container_W * (crop_w / src_w)
+// = container_W * (src_h * 9/16) / src_w = container_W * (9/16) / (16/9) = container_W * 81/256
+const CROP_RECT_FRACTION = 81 / 256; // ≈ 0.3164
+
+function openCropEditor(seg, rangeIndex) {
+  cropRangeIndex = rangeIndex;
+  cropXCrop = seg.x_crop != null ? seg.x_crop : 0.5;
+
+  const t = (seg.start + seg.end) / 2;
+  cropFrameImg.src = `/api/frame?source=${encodeURIComponent(seg._sourcePath || '')}&t=${t.toFixed(3)}`;
+
+  cropModal.classList.add('open');
+  updateCropOverlay();
+}
+
+function updateCropOverlay() {
+  const W = cropFrameWrap.clientWidth;
+  const rectW = W * CROP_RECT_FRACTION;
+  const maxLeft = W - rectW;
+  const left = cropXCrop * maxLeft;
+  cropOverlay.style.width = rectW + 'px';
+  cropOverlay.style.left = left + 'px';
+}
+
+// Drag logic
+let _dragging = false;
+let _dragStartX = 0;
+let _dragStartCrop = 0.5;
+
+cropFrameWrap.addEventListener('pointerdown', e => {
+  _dragging = true;
+  _dragStartX = e.clientX;
+  _dragStartCrop = cropXCrop;
+  cropFrameWrap.setPointerCapture(e.pointerId);
+  e.preventDefault();
+});
+
+cropFrameWrap.addEventListener('pointermove', e => {
+  if (!_dragging) return;
+  const W = cropFrameWrap.clientWidth;
+  const rectW = W * CROP_RECT_FRACTION;
+  const maxLeft = W - rectW;
+  if (maxLeft <= 0) return;
+  const dx = e.clientX - _dragStartX;
+  cropXCrop = Math.max(0, Math.min(1, _dragStartCrop + dx / maxLeft));
+  updateCropOverlay();
+});
+
+cropFrameWrap.addEventListener('pointerup', () => { _dragging = false; });
+
+cropCancelBtn.addEventListener('click', () => {
+  cropModal.classList.remove('open');
+});
+
+cropSetBtn.addEventListener('click', async () => {
+  try {
+    const res = await fetch('/api/set_crop', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ range_index: cropRangeIndex, x_crop: Math.round(cropXCrop * 10000) / 10000 }),
+    });
+    if (!res.ok) { const e = await res.json(); alert(e.detail); return; }
+    cropModal.classList.remove('open');
+    loadProject();
+  } catch (err) {
+    alert('Failed to save crop: ' + err.message);
+  }
+});
+
+// keep overlay synced if the modal is resized
+new ResizeObserver(() => { if (cropModal.classList.contains('open')) updateCropOverlay(); }).observe(cropFrameWrap);
 
 // ── Image modal ────────────────────────────────────────────────────────────
 imgModal.addEventListener('click', () => imgModal.classList.remove('open'));

@@ -187,11 +187,18 @@ async def api_render(request: Request):
     edl_path = EDIT_DIR / "edl.json"
     if not edl_path.exists():
         raise HTTPException(status_code=400, detail="edl.json not found — ask the editor to create a cut first")
-    out_name = "preview.mp4" if mode == "preview" else "final.mp4"
+    if mode == "preview":
+        out_name = "preview.mp4"
+    elif mode == "vertical":
+        out_name = "vertical.mp4"
+    else:
+        out_name = "final.mp4"
     out_path = EDIT_DIR / out_name
     cmd = [sys.executable, str(HERE / "helpers" / "render.py"), str(edl_path), "-o", str(out_path)]
     if mode == "preview":
         cmd.append("--preview")
+    elif mode == "vertical":
+        cmd.append("--vertical")
 
     async def _sse():
         proc = await asyncio.create_subprocess_exec(
@@ -205,6 +212,66 @@ async def api_render(request: Request):
         yield f"data: {json.dumps({'status': status, 'path': f'edit/{out_name}', 'mode': mode})}\n\n"
 
     return StreamingResponse(_sse(), media_type="text/event-stream")
+
+
+# ── API: frame extraction (for crop editor) ────────────────────────────────────
+
+@app.get("/api/frame")
+async def api_frame(source: str, t: float, request: Request):
+    """Extract a single JPEG frame at time t from source for the vertical crop editor."""
+    p = Path(source) if Path(source).is_absolute() else VIDEOS_DIR / source
+    if not p.exists() or not p.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    try:
+        p.relative_to(VIDEOS_DIR)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{t:.3f}",
+        "-i", str(p),
+        "-frames:v", "1",
+        "-q:v", "3",
+        "-vf", "scale=960:-2",
+        "-f", "image2pipe",
+        "-vcodec", "mjpeg",
+        "pipe:1",
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+    )
+    jpeg_bytes, _ = await proc.communicate()
+    if proc.returncode != 0 or not jpeg_bytes:
+        raise HTTPException(status_code=500, detail="Frame extraction failed")
+    return StreamingResponse(iter([jpeg_bytes]), media_type="image/jpeg")
+
+
+# ── API: set per-range crop ────────────────────────────────────────────────────
+
+@app.post("/api/set_crop")
+async def api_set_crop(request: Request):
+    """Write x_crop (0.0–1.0) for a single EDL range."""
+    body = await request.json()
+    range_index = int(body["range_index"])
+    x_crop = max(0.0, min(1.0, float(body["x_crop"])))
+
+    edl_path = EDIT_DIR / "edl.json"
+    if not edl_path.exists():
+        raise HTTPException(status_code=400, detail="edl.json not found")
+
+    async with aiofiles.open(edl_path) as f:
+        edl = json.loads(await f.read())
+
+    if range_index < 0 or range_index >= len(edl.get("ranges", [])):
+        raise HTTPException(status_code=400, detail="range_index out of bounds")
+
+    edl["ranges"][range_index]["x_crop"] = round(x_crop, 4)
+
+    async with aiofiles.open(edl_path, "w") as f:
+        await f.write(json.dumps(edl, indent=2))
+
+    return JSONResponse({"ok": True, "range_index": range_index, "x_crop": edl["ranges"][range_index]["x_crop"]})
 
 
 # ── API: export Resolve package ────────────────────────────────────────────────

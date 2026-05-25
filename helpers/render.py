@@ -234,6 +234,7 @@ def extract_segment(
     draft: bool = False,
     vertical: bool = False,
     audio_streams: int = 1,
+    x_crop: float | None = None,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
@@ -265,7 +266,12 @@ def extract_segment(
         # Compute scaled width (even), then find subject x via gradient energy
         scaled_w = int(src_w * scale_h / src_h)
         scaled_w -= scaled_w % 2
-        x = find_subject_x(source, seg_start, seg_start + duration, scaled_w, crop_w)
+        if x_crop is not None:
+            raw_x = int((scaled_w - crop_w) * x_crop)
+            raw_x = max(0, min(scaled_w - crop_w, raw_x))
+            x = raw_x - raw_x % 2
+        else:
+            x = find_subject_x(source, seg_start, seg_start + duration, scaled_w, crop_w)
         crop = f"crop={crop_w}:{crop_h}:{x}:0"
     else:
         # Normal horizontal output (or portrait source staying portrait).
@@ -372,7 +378,7 @@ def extract_all_segments(
         print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
-        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft, vertical=vertical, audio_streams=audio_streams)
+        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft, vertical=vertical, audio_streams=audio_streams, x_crop=r.get("x_crop"))
         seg_paths.append(out_path)
 
     return seg_paths
