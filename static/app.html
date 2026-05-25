@@ -90,6 +90,10 @@ body {
   background: var(--blue);
   color: #0a0a12;
 }
+.btn-green {
+  background: var(--green);
+  color: #0a0a12;
+}
 
 /* ── Main layout ─────────────────────────────────────────────────── */
 #main {
@@ -376,6 +380,7 @@ body {
   <span class="logo">video-use</span>
   <span class="path" id="proj-path">—</span>
   <div class="actions">
+    <button class="btn btn-green" id="transcribe-btn" style="display:none">Transcribe footage</button>
     <button class="btn btn-ghost" id="render-preview-btn" disabled>Preview</button>
     <button class="btn btn-blue" id="render-final-btn" disabled>Render Final</button>
     <button class="btn btn-accent" id="export-btn" disabled>Export for Resolve</button>
@@ -438,6 +443,7 @@ const player      = document.getElementById('player');
 const playerPlaceholder = document.getElementById('player-placeholder');
 const timelineTrack = document.getElementById('timeline-track');
 const projPathEl  = document.getElementById('proj-path');
+const transcribeBtn    = document.getElementById('transcribe-btn');
 const renderPreviewBtn = document.getElementById('render-preview-btn');
 const renderFinalBtn   = document.getElementById('render-final-btn');
 const exportBtn        = document.getElementById('export-btn');
@@ -633,6 +639,8 @@ function loadVideo(path) {
 }
 
 // ── Project state ──────────────────────────────────────────────────────────
+let _projectLoadedOnce = false;
+
 async function loadProject() {
   try {
     const res = await fetch('/api/project');
@@ -648,6 +656,22 @@ async function loadProject() {
     const hasEdl = !!data.edl;
     renderPreviewBtn.disabled = !hasEdl;
     exportBtn.disabled = !data.final_available;
+
+    // Show transcribe button only when clips exist but no transcript yet
+    const needsTranscribe = data.sources.length > 0 && !data.takes_packed;
+    transcribeBtn.style.display = needsTranscribe ? '' : 'none';
+
+    // On first load, if clips found but no transcript, surface them in chat
+    if (!_projectLoadedOnce) {
+      _projectLoadedOnce = true;
+      if (needsTranscribe) {
+        const names = data.sources.map(s => s.name).join(', ');
+        const bubble = addMessage('assistant',
+          `Found ${data.sources.length} clip${data.sources.length !== 1 ? 's' : ''}: ${names}\n\nHit Transcribe footage to begin, or tell me what you're making first.`
+        );
+        bubble.closest('.msg').querySelector('.msg-label').textContent = 'editor';
+      }
+    }
   } catch (e) {
     console.error('loadProject', e);
   }
@@ -715,6 +739,15 @@ inputEl.addEventListener('input', () => {
 });
 
 // ── Header buttons ─────────────────────────────────────────────────────────
+transcribeBtn.addEventListener('click', () => {
+  if (busy || !ws || ws.readyState !== WebSocket.OPEN) return;
+  transcribeBtn.style.display = 'none';
+  addMessage('user', 'Transcribe footage');
+  startAssistantMessage();
+  setBusy(true);
+  ws.send(JSON.stringify({ message: 'Please transcribe all the footage and pack the transcripts.' }));
+});
+
 renderPreviewBtn.addEventListener('click', async () => {
   renderPreviewBtn.disabled = true;
   renderPreviewBtn.textContent = 'Rendering…';
