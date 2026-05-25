@@ -276,10 +276,20 @@ TOOLS = [
             "required": ["source_path", "start", "end"],
         },
     },
+    {
+        "name": "read_transcript",
+        "description": "Return the full contents of takes_packed.md. Use this to read the transcript before making cut decisions.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
 ]
 
 
 async def _run_tool(name: str, tool_input: dict, ws: WebSocket) -> str:
+    if name == "read_transcript":
+        packed = EDIT_DIR / "takes_packed.md"
+        if packed.exists():
+            return packed.read_text()
+        return "No transcript found. Call run_transcribe first."
     if name == "write_edl":
         edl = tool_input["edl"]
         EDIT_DIR.mkdir(parents=True, exist_ok=True)
@@ -388,9 +398,15 @@ async def _run_tool(name: str, tool_input: dict, ws: WebSocket) -> str:
 def _build_system() -> list[dict]:
     """Return system as a list of blocks with prompt-cache markers."""
     base = (
-        "You are a professional video editor operating the video-use editing skill. "
-        "Help the user edit their video through conversation, following every rule in the SKILL.md below.\n\n"
-        "Always confirm the editing strategy in plain English before writing the EDL. "
+        "You are a professional video editor operating the video-use editing skill inside a web UI.\n\n"
+        "## Important: web context differences from the CLI skill\n"
+        "- You do NOT have Bash, Read, Write, or any filesystem tools. Do not ask for them.\n"
+        "- The transcript (takes_packed.md) is injected directly into this system prompt below — "
+        "you already have it. You do NOT need to read any files to access it.\n"
+        "- If for any reason you need to re-read the transcript, use the `read_transcript` tool.\n"
+        "- Your only tools are: write_edl, render_preview, render_final, run_transcribe, "
+        "timeline_view, read_transcript.\n"
+        "- Always confirm the editing strategy in plain English before calling write_edl.\n\n"
         f"Videos directory: {VIDEOS_DIR}\nEdit directory: {EDIT_DIR}\n\n"
     )
     blocks = [
