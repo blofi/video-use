@@ -166,12 +166,52 @@ def extract_clip(
 #            finds no overlap, and does not place the clip's picture on the timeline.
 #
 # Correct coordinate system (all values in absolute source TC space):
-#   available_range.start_time = tc_offset + floor(h_in * fps)         ← matches .mov embedded TC
+#   available_range.start_time = file_tc0                               ← probed from file, not assumed
 #   available_range.duration   = floor((h_out-h_in) * fps)              ← total .mov length
-#   source_range.start_time    = tc_offset + floor(edit_in * fps)       ← absolute in source
+#   source_range.start_time    = file_tc0 + floor((edit_in-h_in) * fps) ← edit_in relative to file start
 #   source_range.duration      = floor((edit_out-edit_in) * fps)
 #
-# tc_offset = round(fps) * 3600  (= 01:00:00:00 in frames; broadcast MXF default source TC)
+# file_tc0 is always probed via detect_tc_frames() — never hardcoded or defaulted.
+# write_otio() re-probes every clip after writing and raises if anything mismatches.
+
+
+def detect_tc_frames(video: Path, fps: float) -> int:
+    """Return the embedded TC start of *video* as an integer frame count.
+
+    Probes both stream-level and format-level timecode tags so it works for
+    MP4 (format tag), MXF (stream tag), and MOV (either).
+
+    Raises ValueError if no TC tag is found. The caller must handle the
+    ambiguous case explicitly — silently treating a missing-TC file as
+    00:00:00:00 is the root cause of Resolve OTIO available_range mismatches.
+    """
+    out = subprocess.run(
+        ["ffprobe", "-v", "quiet",
+         "-show_entries", "stream_tags=timecode:format_tags=timecode",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(video)],
+        capture_output=True, text=True,
+    )
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if len(line) == 11 and line[2] == ':' and line[5] == ':' and line[8] == ':':
+            hh, mm, ss, ff = int(line[0:2]), int(line[3:5]), int(line[6:8]), int(line[9:11])
+            return (hh * 3600 + mm * 60 + ss) * round(fps) + ff
+    raise ValueError(
+        f"{video.name!r} has no embedded timecode tag.\n"
+        "Embed one before generating OTIO:\n"
+        "  ffmpeg -i input.mp4 -c copy -timecode 00:00:00:00 output.mp4\n"
+        "If the file genuinely starts at 00:00:00:00, embed that TC explicitly\n"
+        "so future tooling can verify it rather than guess."
+    )
+
+
+def _frames_to_tc(frames: int, fps: float) -> str:
+    fps_int = round(fps)
+    ff = frames % fps_int
+    sc = (frames // fps_int) % 60
+    mn = (frames // fps_int // 60) % 60
+    hr = frames // fps_int // 3600
+    return f"{hr:02d}:{mn:02d}:{sc:02d}:{ff:02d}"
 
 
 def make_otio_clip(
@@ -182,13 +222,18 @@ def make_otio_clip(
     h_in: float,
     h_out: float,
     fps: float,
-    tc_offset_frames: int = 0,
+    file_tc0_frames: int,
 ) -> otio.schema.Clip:
+    """Build one OTIO clip.
+
+    file_tc0_frames: actual embedded TC of the clip file in frames,
+    as returned by detect_tc_frames(). All positions are in that TC space.
+    """
     rate = fps
     media_ref = otio.schema.ExternalReference(
-        target_url=file.resolve().as_uri(),
+        target_url="file://" + str(file.resolve()),
         available_range=otio.opentime.TimeRange(
-            start_time=otio.opentime.RationalTime(tc_offset_frames + fr(h_in, fps), rate),
+            start_time=otio.opentime.RationalTime(file_tc0_frames, rate),
             duration=otio.opentime.RationalTime(fr(h_out - h_in, fps), rate),
         ),
     )
@@ -196,21 +241,43 @@ def make_otio_clip(
         name=name,
         media_reference=media_ref,
         source_range=otio.opentime.TimeRange(
-            start_time=otio.opentime.RationalTime(tc_offset_frames + fr(edit_in, fps), rate),
+            start_time=otio.opentime.RationalTime(
+                file_tc0_frames + fr(edit_in - h_in, fps), rate
+            ),
             duration=otio.opentime.RationalTime(fr(edit_out - edit_in, fps), rate),
         ),
     )
 
 
-def write_otio(clips_data: list[dict], fps: float, timeline_name: str, out_path: Path) -> None:
-    tc_offset_frames = round(fps) * 3600   # 01:00:00:00 — broadcast MXF source TC default
+def _validate_otio_tc(clips_data: list[dict], fps: float, otio_path: Path) -> None:
+    """Re-probe each clip's embedded TC and assert it matches available_range in the OTIO."""
+    tl = otio.adapters.read_from_file(str(otio_path))
+    v_track = next(t for t in tl.tracks if t.kind == otio.schema.TrackKind.Video)
+    mismatches = []
+    for clip, d in zip(v_track, clips_data):
+        actual  = detect_tc_frames(d["file"], fps)
+        written = int(clip.media_reference.available_range.start_time.value)
+        if actual != written:
+            mismatches.append(
+                f"  {d['name']}: file={_frames_to_tc(actual, fps)}  "
+                f"otio={_frames_to_tc(written, fps)}"
+            )
+    if mismatches:
+        raise AssertionError(
+            "OTIO TC validation failed — available_range does not match file TC:\n"
+            + "\n".join(mismatches)
+        )
+    print(f"  otio TC validated ({len(clips_data)} clips)")
 
+
+def write_otio(clips_data: list[dict], fps: float, timeline_name: str, out_path: Path) -> None:
     video_track = otio.schema.Track(name="V1", kind=otio.schema.TrackKind.Video)
     audio_track = otio.schema.Track(name="A1", kind=otio.schema.TrackKind.Audio)
 
     for d in clips_data:
-        clip_v = make_otio_clip(**d, fps=fps, tc_offset_frames=tc_offset_frames)
-        clip_a = make_otio_clip(**d, fps=fps, tc_offset_frames=tc_offset_frames)
+        file_tc0 = detect_tc_frames(d["file"], fps)  # raises if no TC — no silent fallback
+        clip_v = make_otio_clip(**d, fps=fps, file_tc0_frames=file_tc0)
+        clip_a = make_otio_clip(**d, fps=fps, file_tc0_frames=file_tc0)
         video_track.append(clip_v)
         audio_track.append(clip_a)
 
@@ -220,6 +287,7 @@ def write_otio(clips_data: list[dict], fps: float, timeline_name: str, out_path:
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     otio.adapters.write_to_file(timeline, str(out_path))
+    _validate_otio_tc(clips_data, fps, out_path)
 
 
 # -------- Clip name derivation ------------------------------------------------
