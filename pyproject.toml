@@ -11,6 +11,11 @@ dependencies = [
     "pillow",
     "numpy",
     "opentimelineio",
+    "fastapi",
+    "uvicorn[standard]",
+    "anthropic>=0.40.0",
+    "aiofiles",
+    "python-multipart",
 ]
 
 [project.optional-dependencies]

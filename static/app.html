@@ -1,0 +1,776 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>video-use</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:        #0f0f18;
+  --surface:   #16161f;
+  --surface2:  #1e1e2a;
+  --border:    #2a2a3a;
+  --text:      #e2e2e8;
+  --muted:     #6b6b80;
+  --accent:    #ff6b35;
+  --blue:      #6b9fff;
+  --green:     #34d399;
+  --red:       #f87171;
+  --mono:      'JetBrains Mono', monospace;
+  --sans:      'Inter', system-ui, sans-serif;
+}
+
+body {
+  font-family: var(--sans);
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ── Header ─────────────────────────────────────────────────────── */
+#header {
+  flex-shrink: 0;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 10px 18px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+#header .logo {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  letter-spacing: 0.05em;
+  flex-shrink: 0;
+}
+#header .path {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+#header .actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.btn {
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.btn:hover { opacity: 0.85; }
+.btn:disabled { opacity: 0.4; cursor: default; }
+.btn-ghost {
+  background: var(--surface2);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.btn-accent {
+  background: var(--accent);
+  color: white;
+}
+.btn-blue {
+  background: var(--blue);
+  color: #0a0a12;
+}
+
+/* ── Main layout ─────────────────────────────────────────────────── */
+#main {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+  min-height: 0;
+}
+
+/* ── Chat panel ──────────────────────────────────────────────────── */
+#chat-panel {
+  width: 360px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+  min-height: 0;
+}
+#messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px 14px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  scroll-behavior: smooth;
+}
+#messages::-webkit-scrollbar { width: 4px; }
+#messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+.msg {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-width: 100%;
+}
+.msg-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 0 2px;
+}
+.msg-user .msg-label { color: var(--accent); text-align: right; }
+.msg-bubble {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 9px 12px;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.msg-user .msg-bubble {
+  background: rgba(255, 107, 53, 0.12);
+  border-color: rgba(255, 107, 53, 0.25);
+  align-self: flex-end;
+  text-align: right;
+}
+.msg-assistant .msg-bubble { align-self: flex-start; }
+
+/* tool chips */
+.tool-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  background: rgba(107, 159, 255, 0.1);
+  border: 1px solid rgba(107, 159, 255, 0.25);
+  color: var(--blue);
+  border-radius: 6px;
+  padding: 4px 10px;
+  margin: 2px 0;
+}
+.tool-chip.running::before {
+  content: '';
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border: 1.5px solid var(--blue);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+.tool-chip.done { color: var(--green); border-color: rgba(52, 211, 153, 0.25); background: rgba(52, 211, 153, 0.08); }
+.tool-chip.done::before { content: '✓'; font-size: 11px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.progress-log {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+  padding: 4px 0 0 2px;
+  line-height: 1.5;
+  max-height: 80px;
+  overflow: hidden;
+}
+
+.timeline-img {
+  max-width: 100%;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  margin-top: 4px;
+  cursor: zoom-in;
+}
+.timeline-img-caption {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+  margin-top: 3px;
+}
+
+.error-bubble {
+  background: rgba(248, 113, 113, 0.1);
+  border-color: rgba(248, 113, 113, 0.3);
+  color: var(--red);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+/* input area */
+#input-area {
+  flex-shrink: 0;
+  border-top: 1px solid var(--border);
+  padding: 12px;
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+}
+#msg-input {
+  flex: 1;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 13px;
+  padding: 9px 12px;
+  resize: none;
+  line-height: 1.4;
+  max-height: 120px;
+  min-height: 40px;
+  overflow-y: auto;
+}
+#msg-input:focus { outline: none; border-color: rgba(255,107,53,0.4); }
+#msg-input::placeholder { color: var(--muted); }
+#send-btn {
+  height: 40px;
+  width: 40px;
+  border-radius: 8px;
+  border: none;
+  background: var(--accent);
+  color: white;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  font-size: 16px;
+  transition: opacity 0.15s;
+}
+#send-btn:hover { opacity: 0.85; }
+#send-btn:disabled { opacity: 0.4; cursor: default; }
+
+/* ── Right panel ─────────────────────────────────────────────────── */
+#right-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* ── Video player ────────────────────────────────────────────────── */
+#player-section {
+  flex: 1;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  min-height: 0;
+}
+#player {
+  max-width: 100%;
+  max-height: 100%;
+  display: none;
+}
+#player-placeholder {
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+  padding: 32px;
+  line-height: 1.6;
+}
+#player-placeholder strong { color: var(--text); display: block; margin-bottom: 6px; font-size: 16px; }
+
+/* ── Shot timeline ───────────────────────────────────────────────── */
+#timeline-section {
+  flex-shrink: 0;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  padding: 10px 14px;
+  min-height: 72px;
+  max-height: 110px;
+}
+#timeline-header {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+#timeline-track {
+  display: flex;
+  gap: 3px;
+  height: 36px;
+  align-items: stretch;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+#timeline-track::-webkit-scrollbar { height: 3px; }
+#timeline-track::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+.shot-block {
+  flex-shrink: 0;
+  border-radius: 5px;
+  padding: 3px 7px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  transition: opacity 0.12s, outline 0.12s;
+  min-width: 40px;
+  font-size: 10px;
+  font-weight: 700;
+  font-family: var(--mono);
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  border: 2px solid transparent;
+  user-select: none;
+}
+.shot-block:hover { opacity: 0.85; }
+.shot-block.active { border-color: white; }
+#timeline-empty {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 36px;
+}
+
+/* beat color palette */
+.beat-hook     { background: rgba(255,107,53,0.25); color: #ff8a60; }
+.beat-solution { background: rgba(52,211,153,0.2);  color: #34d399; }
+.beat-problem  { background: rgba(248,113,113,0.2); color: #f87171; }
+.beat-cta      { background: rgba(107,159,255,0.2); color: #6b9fff; }
+.beat-default  { background: rgba(255,255,255,0.07); color: #9999b0; }
+
+/* modal for full-size timeline PNGs */
+#img-modal {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.85);
+  z-index: 999;
+  align-items: center;
+  justify-content: center;
+  cursor: zoom-out;
+}
+#img-modal.open { display: flex; }
+#img-modal img { max-width: 95vw; max-height: 95vh; border-radius: 8px; }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div id="header">
+  <span class="logo">video-use</span>
+  <span class="path" id="proj-path">—</span>
+  <div class="actions">
+    <button class="btn btn-ghost" id="render-preview-btn" disabled>Preview</button>
+    <button class="btn btn-blue" id="render-final-btn" disabled>Render Final</button>
+    <button class="btn btn-accent" id="export-btn" disabled>Export for Resolve</button>
+  </div>
+</div>
+
+<!-- Main -->
+<div id="main">
+
+  <!-- Chat -->
+  <div id="chat-panel">
+    <div id="messages">
+      <div class="msg msg-assistant">
+        <div class="msg-label">editor</div>
+        <div class="msg-bubble">Hello! Drop your footage in the project directory and tell me what you're making — or just say <em>transcribe</em> to get started.</div>
+      </div>
+    </div>
+    <div id="input-area">
+      <textarea id="msg-input" placeholder="Describe your edit…" rows="1"></textarea>
+      <button id="send-btn" title="Send">&#x2191;</button>
+    </div>
+  </div>
+
+  <!-- Right: player + timeline -->
+  <div id="right-panel">
+    <div id="player-section">
+      <video id="player" controls></video>
+      <div id="player-placeholder">
+        <strong>No preview yet</strong>
+        Ask the editor to transcribe your footage and create a cut.<br>
+        The video will appear here once a preview is rendered.
+      </div>
+    </div>
+    <div id="timeline-section">
+      <div id="timeline-header">Shot timeline</div>
+      <div id="timeline-track"><span id="timeline-empty">No cut yet — the timeline will appear after the first render.</span></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Full-size image modal -->
+<div id="img-modal">
+  <img id="modal-img" src="" alt="">
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+let ws = null;
+let currentSegments = [];   // [{beat, outputStart, duration, source, start, end}]
+let busy = false;           // LLM is mid-response
+let currentAssistantBubble = null;
+let currentToolBlock = null;
+
+// ── DOM refs ───────────────────────────────────────────────────────────────
+const messagesEl  = document.getElementById('messages');
+const inputEl     = document.getElementById('msg-input');
+const sendBtn     = document.getElementById('send-btn');
+const player      = document.getElementById('player');
+const playerPlaceholder = document.getElementById('player-placeholder');
+const timelineTrack = document.getElementById('timeline-track');
+const projPathEl  = document.getElementById('proj-path');
+const renderPreviewBtn = document.getElementById('render-preview-btn');
+const renderFinalBtn   = document.getElementById('render-final-btn');
+const exportBtn        = document.getElementById('export-btn');
+const imgModal         = document.getElementById('img-modal');
+const modalImg         = document.getElementById('modal-img');
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function scrollToBottom() {
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function setBusy(val) {
+  busy = val;
+  sendBtn.disabled = val;
+  inputEl.disabled = val;
+}
+
+function addMessage(role, text) {
+  const wrap = document.createElement('div');
+  wrap.className = `msg msg-${role}`;
+  const label = document.createElement('div');
+  label.className = 'msg-label';
+  label.textContent = role === 'user' ? 'you' : 'editor';
+  const bubble = document.createElement('div');
+  bubble.className = 'msg-bubble';
+  bubble.textContent = text;
+  wrap.appendChild(label);
+  wrap.appendChild(bubble);
+  messagesEl.appendChild(wrap);
+  scrollToBottom();
+  return bubble;
+}
+
+function addErrorMessage(text) {
+  const wrap = document.createElement('div');
+  wrap.className = 'msg msg-assistant';
+  const label = document.createElement('div');
+  label.className = 'msg-label';
+  label.textContent = 'error';
+  const bubble = document.createElement('div');
+  bubble.className = 'msg-bubble error-bubble';
+  bubble.textContent = text;
+  wrap.appendChild(label);
+  wrap.appendChild(bubble);
+  messagesEl.appendChild(wrap);
+  scrollToBottom();
+}
+
+function startAssistantMessage() {
+  const wrap = document.createElement('div');
+  wrap.className = 'msg msg-assistant';
+  const label = document.createElement('div');
+  label.className = 'msg-label';
+  label.textContent = 'editor';
+  const bubble = document.createElement('div');
+  bubble.className = 'msg-bubble';
+  bubble.textContent = '';
+  wrap.appendChild(label);
+  wrap.appendChild(bubble);
+  messagesEl.appendChild(wrap);
+  currentAssistantBubble = bubble;
+  scrollToBottom();
+  return bubble;
+}
+
+function appendToken(text) {
+  if (!currentAssistantBubble) startAssistantMessage();
+  currentAssistantBubble.textContent += text;
+  scrollToBottom();
+}
+
+function addToolChip(toolName) {
+  // End current text bubble so chip is separate
+  currentAssistantBubble = null;
+  const wrap = document.createElement('div');
+  wrap.className = 'msg msg-assistant';
+  const chip = document.createElement('div');
+  chip.className = 'tool-chip running';
+  chip.textContent = toolName.replace(/_/g, ' ');
+  chip.dataset.tool = toolName;
+  const log = document.createElement('div');
+  log.className = 'progress-log';
+  log.id = `log-${toolName}-${Date.now()}`;
+  wrap.appendChild(chip);
+  wrap.appendChild(log);
+  messagesEl.appendChild(wrap);
+  currentToolBlock = { chip, log };
+  scrollToBottom();
+}
+
+function appendToolLog(line) {
+  if (currentToolBlock) {
+    currentToolBlock.log.textContent = line;
+  }
+}
+
+function finishToolChip() {
+  if (currentToolBlock) {
+    currentToolBlock.chip.classList.remove('running');
+    currentToolBlock.chip.classList.add('done');
+    currentToolBlock = null;
+  }
+  currentAssistantBubble = null;
+}
+
+function addTimelineImage(url, source, start, end) {
+  currentAssistantBubble = null;
+  const wrap = document.createElement('div');
+  wrap.className = 'msg msg-assistant';
+  const label = document.createElement('div');
+  label.className = 'msg-label';
+  label.textContent = 'timeline view';
+  const img = document.createElement('img');
+  img.className = 'timeline-img';
+  img.src = url;
+  img.alt = `timeline ${source} ${start.toFixed(2)}–${end.toFixed(2)}s`;
+  img.addEventListener('click', () => { modalImg.src = url; imgModal.classList.add('open'); });
+  const caption = document.createElement('div');
+  caption.className = 'timeline-img-caption';
+  caption.textContent = `${source}  ${start.toFixed(2)}s → ${end.toFixed(2)}s`;
+  wrap.appendChild(label);
+  wrap.appendChild(img);
+  wrap.appendChild(caption);
+  messagesEl.appendChild(wrap);
+  scrollToBottom();
+}
+
+// ── Beat color class ───────────────────────────────────────────────────────
+function beatClass(beat) {
+  if (!beat) return 'beat-default';
+  const b = beat.toUpperCase();
+  if (b.includes('HOOK') || b.includes('INTRO')) return 'beat-hook';
+  if (b.includes('SOLUTION') || b.includes('BENEFIT') || b.includes('ANSWER')) return 'beat-solution';
+  if (b.includes('PROBLEM') || b.includes('ISSUE') || b.includes('CHALLENGE')) return 'beat-problem';
+  if (b.includes('CTA') || b.includes('CALL') || b.includes('ACTION') || b.includes('OUTRO')) return 'beat-cta';
+  return 'beat-default';
+}
+
+// ── Shot timeline ──────────────────────────────────────────────────────────
+function buildTimeline(edl) {
+  if (!edl || !edl.ranges || !edl.ranges.length) return;
+
+  const ranges = edl.ranges;
+  let offset = 0;
+  const segments = ranges.map(r => {
+    const dur = Math.max(0.1, r.end - r.start);
+    const s = { ...r, duration: dur, outputStart: offset };
+    offset += dur;
+    return s;
+  });
+  currentSegments = segments;
+
+  const total = segments.reduce((s, r) => s + r.duration, 0);
+  timelineTrack.innerHTML = '';
+
+  segments.forEach((seg, i) => {
+    const widthPct = (seg.duration / total * 100).toFixed(2);
+    const block = document.createElement('div');
+    block.className = `shot-block ${beatClass(seg.beat)}`;
+    block.style.width = `max(40px, ${widthPct}%)`;
+    block.dataset.outputStart = seg.outputStart;
+    block.dataset.outputEnd = seg.outputStart + seg.duration;
+    block.title = [
+      seg.beat || seg.source,
+      `${seg.start.toFixed(2)}s → ${seg.end.toFixed(2)}s`,
+      seg.quote ? `"${seg.quote.slice(0, 60)}…"` : '',
+    ].filter(Boolean).join('\n');
+    block.textContent = seg.beat || `${seg.source} ${i + 1}`;
+    block.addEventListener('click', () => {
+      player.currentTime = seg.outputStart;
+      if (player.paused) player.play();
+    });
+    timelineTrack.appendChild(block);
+  });
+}
+
+function updatePlayhead(currentTime) {
+  document.querySelectorAll('.shot-block').forEach(el => {
+    const s = parseFloat(el.dataset.outputStart);
+    const e = parseFloat(el.dataset.outputEnd);
+    el.classList.toggle('active', currentTime >= s && currentTime < e);
+  });
+}
+
+player.addEventListener('timeupdate', () => updatePlayhead(player.currentTime));
+
+// ── Video reload ───────────────────────────────────────────────────────────
+function loadVideo(path) {
+  player.src = `/video?path=${encodeURIComponent(path)}&_=${Date.now()}`;
+  player.style.display = 'block';
+  playerPlaceholder.style.display = 'none';
+  player.load();
+}
+
+// ── Project state ──────────────────────────────────────────────────────────
+async function loadProject() {
+  try {
+    const res = await fetch('/api/project');
+    const data = await res.json();
+    projPathEl.textContent = data.videos_dir;
+    if (data.edl) buildTimeline(data.edl);
+    if (data.preview_available) {
+      loadVideo('edit/preview.mp4');
+      renderFinalBtn.disabled = false;
+    } else if (data.final_available) {
+      loadVideo('edit/final.mp4');
+    }
+    const hasEdl = !!data.edl;
+    renderPreviewBtn.disabled = !hasEdl;
+    exportBtn.disabled = !data.final_available;
+  } catch (e) {
+    console.error('loadProject', e);
+  }
+}
+
+// ── WebSocket ──────────────────────────────────────────────────────────────
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/chat`);
+
+  ws.onmessage = e => {
+    const data = JSON.parse(e.data);
+
+    if (data.type === 'token') {
+      appendToken(data.text);
+    } else if (data.type === 'tool_start') {
+      addToolChip(data.tool);
+    } else if (data.type === 'tool_progress') {
+      appendToolLog(data.line);
+    } else if (data.type === 'tool_done') {
+      finishToolChip();
+    } else if (data.type === 'render_done') {
+      loadVideo(data.path);
+      loadProject();
+    } else if (data.type === 'timeline_png') {
+      addTimelineImage(data.url, data.source, data.start, data.end);
+    } else if (data.type === 'transcript_ready') {
+      loadProject();
+    } else if (data.type === 'done') {
+      currentAssistantBubble = null;
+      currentToolBlock = null;
+      setBusy(false);
+    } else if (data.type === 'error') {
+      addErrorMessage(data.message);
+      setBusy(false);
+    }
+  };
+
+  ws.onclose = () => {
+    setTimeout(connect, 2000);
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+// ── Send message ───────────────────────────────────────────────────────────
+function sendMessage() {
+  const text = inputEl.value.trim();
+  if (!text || busy || !ws || ws.readyState !== WebSocket.OPEN) return;
+  inputEl.value = '';
+  inputEl.style.height = 'auto';
+  addMessage('user', text);
+  startAssistantMessage();
+  setBusy(true);
+  ws.send(JSON.stringify({ message: text }));
+}
+
+sendBtn.addEventListener('click', sendMessage);
+inputEl.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+inputEl.addEventListener('input', () => {
+  inputEl.style.height = 'auto';
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px';
+});
+
+// ── Header buttons ─────────────────────────────────────────────────────────
+renderPreviewBtn.addEventListener('click', async () => {
+  renderPreviewBtn.disabled = true;
+  renderPreviewBtn.textContent = 'Rendering…';
+  try {
+    const res = await fetch('/api/render', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode: 'preview'}) });
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      const lines = dec.decode(value).split('\n').filter(l => l.startsWith('data:'));
+      for (const line of lines) {
+        const d = JSON.parse(line.slice(5));
+        if (d.status === 'done') { loadVideo(d.path); loadProject(); }
+      }
+    }
+  } finally {
+    renderPreviewBtn.textContent = 'Preview';
+    loadProject();
+  }
+});
+
+renderFinalBtn.addEventListener('click', async () => {
+  renderFinalBtn.disabled = true;
+  renderFinalBtn.textContent = 'Rendering…';
+  try {
+    await fetch('/api/render', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode: 'final'}) });
+  } finally {
+    renderFinalBtn.textContent = 'Render Final';
+    loadProject();
+  }
+});
+
+exportBtn.addEventListener('click', async () => {
+  exportBtn.disabled = true;
+  exportBtn.textContent = 'Exporting…';
+  try {
+    const res = await fetch('/api/export', { method: 'POST' });
+    if (!res.ok) { const e = await res.json(); alert(e.detail); return; }
+    const data = await res.json();
+    const a = document.createElement('a');
+    a.href = `/edit/${data.path.replace('edit/', '')}`;
+    a.download = 'resolve_package.zip';
+    a.click();
+  } finally {
+    exportBtn.textContent = 'Export for Resolve';
+    exportBtn.disabled = false;
+  }
+});
+
+// ── Image modal ────────────────────────────────────────────────────────────
+imgModal.addEventListener('click', () => imgModal.classList.remove('open'));
+
+// ── Init ───────────────────────────────────────────────────────────────────
+connect();
+loadProject();
+</script>
+</body>
+</html>
