@@ -94,7 +94,7 @@ def extract_shot_with_handles(
     handle_s = handle_frames / fps
     h_in  = max(0.0,         seg_start - handle_s)
     h_out = min(src_duration, seg_end   + handle_s)
-    tc    = secs_to_tc(h_in + 3600.0, fps)   # 01:00:00:00 base matches OTIO tc_offset
+    tc    = "01:00:00:00"   # always fixed — we own these clips
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -117,13 +117,15 @@ def extract_shot_with_handles(
 
 # -------- OTIO generation -----------------------------------------------------
 #
-# Coordinate system (Resolve-verified; see extract_clips.py for full bug notes):
-#   available_range.start_time = tc_offset + floor(h_in * fps)          ← matches .mov embedded TC
+# Every exported clip is embedded with TC 01:00:00:00 regardless of where it
+# came from in the source. We own these files, so we fix the base unconditionally.
+#
+#   available_range.start_time = tc_offset                               ← always 01:00:00:00
 #   available_range.duration   = floor((h_out - h_in) * fps)
-#   source_range.start_time    = tc_offset + floor(seg_start * fps)      ← absolute in source TC
+#   source_range.start_time    = tc_offset + floor((seg_start - h_in) * fps)  ← offset into clip
 #   source_range.duration      = floor(cut_duration * fps)
 #
-# tc_offset = round(fps) * 3600  (= 01:00:00:00; broadcast MXF source TC default)
+# tc_offset = round(fps) * 3600  (frames for 01:00:00:00)
 
 
 def write_otio(shots: list[dict], fps: float, out_path: Path) -> None:
@@ -133,17 +135,18 @@ def write_otio(shots: list[dict], fps: float, out_path: Path) -> None:
     h_in (float), h_out (float).
     """
     rate = fps
-    tc_offset = round(fps) * 3600   # 01:00:00:00 — broadcast MXF source TC default
+    tc_offset = round(fps) * 3600   # frames for 01:00:00:00 — matches fixed embedded TC
 
     video_track = otio.schema.Track(name="V1", kind=otio.schema.TrackKind.Video)
     audio_track = otio.schema.Track(name="A1", kind=otio.schema.TrackKind.Audio)
 
     for shot in shots:
+        edit_in_offset = fr(shot["seg_start"] - shot["h_in"], fps)   # frames from clip start to edit-in
         for track in (video_track, audio_track):
             media_ref = otio.schema.ExternalReference(
                 target_url=shot["file"].resolve().as_uri(),
                 available_range=otio.opentime.TimeRange(
-                    start_time=otio.opentime.RationalTime(tc_offset + fr(shot["h_in"], fps), rate),
+                    start_time=otio.opentime.RationalTime(tc_offset, rate),
                     duration=otio.opentime.RationalTime(fr(shot["h_out"] - shot["h_in"], fps), rate),
                 ),
             )
@@ -151,7 +154,7 @@ def write_otio(shots: list[dict], fps: float, out_path: Path) -> None:
                 name=shot["file"].stem,
                 media_reference=media_ref,
                 source_range=otio.opentime.TimeRange(
-                    start_time=otio.opentime.RationalTime(tc_offset + fr(shot["seg_start"], fps), rate),
+                    start_time=otio.opentime.RationalTime(tc_offset + edit_in_offset, rate),
                     duration=otio.opentime.RationalTime(fr(shot["cut_duration"], fps), rate),
                 ),
             )
