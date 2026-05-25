@@ -170,7 +170,7 @@ async def get_project():
                 raw = await f.read()
             result[attr] = json.loads(raw) if fname.endswith(".json") else raw
 
-    video_exts = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".MP4", ".MOV", ".MKV"}
+    video_exts = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".mxf", ".MP4", ".MOV", ".MKV", ".MXF"}
     for f in sorted(VIDEOS_DIR.iterdir()):
         if f.suffix in video_exts and f.is_file():
             result["sources"].append({"name": f.name, "path": str(f)})
@@ -501,7 +501,7 @@ def _build_system() -> list[dict]:
             "text": (
                 "No transcript yet. Use run_transcribe to transcribe and pack the source videos. "
                 f"Source videos in {VIDEOS_DIR}: "
-                + ", ".join(f.name for f in sorted(VIDEOS_DIR.iterdir()) if f.suffix.lower() in {".mp4", ".mov", ".mkv", ".avi", ".m4v"})
+                + ", ".join(f.name for f in sorted(VIDEOS_DIR.iterdir()) if f.suffix.lower() in {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".mxf"})
             ),
         })
 
