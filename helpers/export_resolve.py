@@ -94,7 +94,7 @@ def extract_shot_with_handles(
     handle_s = handle_frames / fps
     h_in  = max(0.0,         seg_start - handle_s)
     h_out = min(src_duration, seg_end   + handle_s)
-    tc    = secs_to_tc(h_in, fps)
+    tc    = secs_to_tc(h_in + 3600.0, fps)   # 01:00:00:00 base matches OTIO tc_offset
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
