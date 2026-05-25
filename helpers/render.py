@@ -144,16 +144,29 @@ def is_hdr_source(video: Path) -> bool:
 
 
 def get_video_dimensions(video: Path) -> tuple[int, int]:
-    """Return (width, height) of the first video stream. Returns (0, 0) on error."""
+    """Return (width, height) of the first video stream. Returns (0, 0) on error.
+
+    Requests both width/height and coded_width/coded_height because broadcast
+    MXF (XDCAM, IMX, DNxHD, etc.) stores dimensions only in the coded_* fields.
+    Falls back to coded_* when the plain fields are absent or zero.
+    """
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height",
+             "-show_entries", "stream=width,height,coded_width,coded_height",
              "-of", "csv=p=0", str(video)],
             capture_output=True, text=True, check=True,
         )
-        w, h = map(int, out.stdout.strip().split(","))
-        return w, h
+        # Take only the first line (some containers produce multiple entries)
+        first = out.stdout.strip().splitlines()[0]
+        parts = first.split(",")
+        def _int(s: str) -> int:
+            try:
+                return int(s)
+            except (ValueError, TypeError):
+                return 0
+        w, h, cw, ch = (_int(parts[i]) if i < len(parts) else 0 for i in range(4))
+        return (w or cw, h or ch)
     except Exception:
         return 0, 0
 
