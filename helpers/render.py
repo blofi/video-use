@@ -403,8 +403,27 @@ def extract_all_segments(
         print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
-        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft, vertical=vertical, audio_streams=audio_streams, x_crop=r.get("x_crop"))
-        seg_paths.append(out_path)
+
+        sub_crops = r.get("sub_crops") if vertical else None
+        if sub_crops and len(sub_crops) > 1:
+            # Split range at each sub-crop boundary; extract each slice with its own crop
+            sorted_sc = sorted(sub_crops, key=lambda s: float(s["offset"]))
+            for j, sc in enumerate(sorted_sc):
+                sub_start = start + float(sc["offset"])
+                sub_end = (start + float(sorted_sc[j + 1]["offset"])) if j + 1 < len(sorted_sc) else end
+                sub_dur = sub_end - sub_start
+                if sub_dur < 0.05:
+                    continue
+                sub_path = clips_dir / f"seg_{i:02d}_{src_name}_s{j:02d}.mp4"
+                extract_segment(src_path, sub_start, sub_dur, seg_filter, sub_path,
+                                preview=preview, draft=draft, vertical=vertical,
+                                audio_streams=audio_streams, x_crop=sc.get("x_crop"))
+                seg_paths.append(sub_path)
+        else:
+            extract_segment(src_path, start, duration, seg_filter, out_path,
+                            preview=preview, draft=draft, vertical=vertical,
+                            audio_streams=audio_streams, x_crop=r.get("x_crop"))
+            seg_paths.append(out_path)
 
     return seg_paths
 

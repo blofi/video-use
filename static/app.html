@@ -347,6 +347,36 @@ body {
 .shot-block:hover { opacity: 0.85; }
 .shot-block.active { border-color: white; }
 .shot-block-label { overflow: hidden; text-overflow: ellipsis; flex: 1; }
+.shot-block { position: relative; } /* needed for tick mark positioning */
+.shot-tick {
+  position: absolute;
+  top: 0; bottom: 0;
+  width: 2px;
+  background: rgba(255,255,255,0.25);
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* sub-shot selector strip in crop editor */
+#sub-shot-strip {
+  display: none;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+#sub-shot-strip.visible { display: flex; }
+.sub-shot-pill {
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid #444;
+  background: rgba(255,255,255,0.07);
+  color: #aaa;
+  font-size: 10px;
+  font-family: var(--mono);
+  cursor: pointer;
+  transition: background 0.1s, border-color 0.1s;
+}
+.sub-shot-pill:hover { background: rgba(255,255,255,0.14); }
+.sub-shot-pill.active { border-color: #6b9fff; color: #6b9fff; background: rgba(107,159,255,0.15); }
 .crop-btn {
   flex-shrink: 0;
   width: 16px; height: 16px;
@@ -522,6 +552,7 @@ body {
       <img id="crop-frame-img" alt="frame" />
       <div id="crop-overlay"></div>
     </div>
+    <div id="sub-shot-strip"></div>
     <div id="crop-modal-actions">
       <button class="btn btn-ghost" id="crop-cancel-btn">Cancel</button>
       <button class="btn btn-blue" id="crop-set-btn">Set crop</button>
@@ -564,6 +595,9 @@ const cropCancelBtn= document.getElementById('crop-cancel-btn');
 const cropSetBtn   = document.getElementById('crop-set-btn');
 let cropRangeIndex = -1;
 let cropXCrop = 0.5;
+let cropSubOffset = 0.0;    // source offset from range start of active sub-shot
+let cropSubDuration = null; // duration of active sub-shot (null = whole range)
+let segmentShots = {};      // rangeIndex → [{time, score}]
 const imgModal         = document.getElementById('img-modal');
 const modalImg         = document.getElementById('modal-img');
 
@@ -755,7 +789,46 @@ function buildTimeline(edl) {
       player.currentTime = seg.outputStart;
       if (player.paused) player.play();
     });
+    block.dataset.rangeIndex = i;
     timelineTrack.appendChild(block);
+  });
+
+  // Fetch shot boundaries asynchronously and inject tick marks
+  loadShotsForAll(segments);
+}
+
+async function loadShotsForAll(segments) {
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (!seg._sourcePath) continue;
+    try {
+      const res = await fetch(
+        `/api/shots?source=${encodeURIComponent(seg._sourcePath)}&start=${seg.start}&end=${seg.end}`
+      );
+      if (!res.ok) continue;
+      const data = await res.json();
+      const cuts = data.cuts || [];
+      segmentShots[i] = cuts;
+      injectTicks(i, seg, cuts);
+    } catch (_) { /* non-critical, skip silently */ }
+  }
+}
+
+function injectTicks(rangeIndex, seg, cuts) {
+  const block = timelineTrack.querySelector(`[data-range-index="${rangeIndex}"]`);
+  if (!block) return;
+  const rangeDur = seg.end - seg.start;
+  if (rangeDur <= 0) return;
+  // Skip the first cut (t=0, always present) — it's the block start itself
+  cuts.slice(1).forEach(cut => {
+    const offsetInRange = cut.time - seg.start;
+    const frac = offsetInRange / rangeDur;
+    if (frac <= 0.02 || frac >= 0.98) return; // too close to edge
+    const tick = document.createElement('div');
+    tick.className = 'shot-tick';
+    tick.style.left = `${(frac * 100).toFixed(2)}%`;
+    tick.title = `Shot cut at ${cut.time.toFixed(2)}s (score ${cut.score})`;
+    block.appendChild(tick);
   });
 }
 
@@ -978,15 +1051,71 @@ renderVerticalBtn.addEventListener('click', async () => {
 // = container_W * (src_h * 9/16) / src_w = container_W * (9/16) / (16/9) = container_W * 81/256
 const CROP_RECT_FRACTION = 81 / 256; // ≈ 0.3164
 
-function openCropEditor(seg, rangeIndex) {
+function openCropEditor(seg, rangeIndex, subOffset, subDuration) {
   cropRangeIndex = rangeIndex;
-  cropXCrop = seg.x_crop != null ? seg.x_crop : 0.5;
+  cropSubOffset = subOffset != null ? subOffset : 0.0;
+  cropSubDuration = subDuration != null ? subDuration : (seg.end - seg.start);
 
-  const t = (seg.start + seg.end) / 2;
-  cropFrameImg.src = `/api/frame?source=${encodeURIComponent(seg._sourcePath || '')}&t=${t.toFixed(3)}`;
+  // Find saved x_crop: check sub_crops first, fall back to range x_crop
+  const subCrops = seg.sub_crops || [];
+  const saved = subCrops.find(sc => Math.abs(sc.offset - cropSubOffset) < 0.05);
+  cropXCrop = saved ? saved.x_crop : (seg.x_crop != null ? seg.x_crop : 0.5);
+
+  // Load frame at midpoint of the active sub-shot
+  const frameT = seg.start + cropSubOffset + cropSubDuration / 2;
+  cropFrameImg.src = `/api/frame?source=${encodeURIComponent(seg._sourcePath || '')}&t=${frameT.toFixed(3)}`;
+
+  document.getElementById('crop-modal-title').textContent =
+    subOffset != null
+      ? `Set vertical crop — ${seg.beat || seg.source} · sub-shot at ${(seg.start + subOffset).toFixed(2)}s`
+      : `Set vertical crop — ${seg.beat || seg.source}`;
+
+  // Build sub-shot strip if shots are known for this range
+  buildSubShotStrip(seg, rangeIndex);
 
   cropModal.classList.add('open');
   requestAnimationFrame(() => updateCropOverlay());
+}
+
+function buildSubShotStrip(seg, rangeIndex) {
+  subShotStrip.innerHTML = '';
+  const cuts = segmentShots[rangeIndex];
+  if (!cuts || cuts.length <= 1) {
+    subShotStrip.classList.remove('visible');
+    return;
+  }
+  subShotStrip.classList.add('visible');
+
+  cuts.forEach((cut, idx) => {
+    const offset = cut.time - seg.start;
+    const nextCut = cuts[idx + 1];
+    const dur = nextCut ? (nextCut.time - cut.time) : (seg.end - cut.time);
+
+    const pill = document.createElement('button');
+    pill.className = 'sub-shot-pill' + (Math.abs(offset - cropSubOffset) < 0.05 ? ' active' : '');
+    pill.textContent = `Shot ${idx + 1} · ${offset.toFixed(1)}s`;
+
+    const subCrops = seg.sub_crops || [];
+    const hasCrop = subCrops.some(sc => Math.abs(sc.offset - offset) < 0.05);
+    if (hasCrop) pill.textContent += ' ·';
+
+    pill.addEventListener('click', () => {
+      cropSubOffset = offset;
+      cropSubDuration = dur;
+      const saved = subCrops.find(sc => Math.abs(sc.offset - offset) < 0.05);
+      cropXCrop = saved ? saved.x_crop : (seg.x_crop != null ? seg.x_crop : 0.5);
+
+      const frameT = seg.start + offset + dur / 2;
+      cropFrameImg.src = `/api/frame?source=${encodeURIComponent(seg._sourcePath || '')}&t=${frameT.toFixed(3)}`;
+      document.getElementById('crop-modal-title').textContent =
+        `Set vertical crop — ${seg.beat || seg.source} · sub-shot at ${(seg.start + offset).toFixed(2)}s`;
+
+      subShotStrip.querySelectorAll('.sub-shot-pill').forEach(p => p.classList.remove('active'));
+      pill.classList.add('active');
+      requestAnimationFrame(() => updateCropOverlay());
+    });
+    subShotStrip.appendChild(pill);
+  });
 }
 
 function updateCropOverlay() {
@@ -1030,10 +1159,17 @@ cropCancelBtn.addEventListener('click', () => {
 
 cropSetBtn.addEventListener('click', async () => {
   try {
-    const res = await fetch('/api/set_crop', {
+    const xCrop = Math.round(cropXCrop * 10000) / 10000;
+    // If a specific sub-shot is selected (offset > 0 or strip visible), use set_sub_crop
+    const useSubCrop = subShotStrip.classList.contains('visible');
+    const url = useSubCrop ? '/api/set_sub_crop' : '/api/set_crop';
+    const body = useSubCrop
+      ? { range_index: cropRangeIndex, offset: cropSubOffset, x_crop: xCrop }
+      : { range_index: cropRangeIndex, x_crop: xCrop };
+    const res = await fetch(url, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ range_index: cropRangeIndex, x_crop: Math.round(cropXCrop * 10000) / 10000 }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) { const e = await res.json(); alert(e.detail); return; }
     cropModal.classList.remove('open');

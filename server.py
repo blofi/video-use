@@ -291,6 +291,93 @@ async def api_set_crop(request: Request):
     return JSONResponse({"ok": True, "range_index": range_index, "x_crop": edl["ranges"][range_index]["x_crop"]})
 
 
+# ── API: shot boundary detection ───────────────────────────────────────────────
+
+@app.get("/api/shots")
+async def api_shots(source: str, start: float = 0.0, end: float = 1e9,
+                    threshold: float = 10.0, force: bool = False):
+    """Return shot cut timestamps within [start, end] for a source file."""
+    p = resolve_source_path(source)
+    if not p.exists() or not p.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    try:
+        p.relative_to(VIDEOS_DIR)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    cache_dir = EDIT_DIR / "shots"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"{p.stem}.json"
+
+    if cache_path.exists() and not force:
+        data = json.loads(cache_path.read_text())
+        if abs(data.get("threshold", -1) - threshold) < 0.01:
+            all_cuts = data["cuts"]
+        else:
+            all_cuts = None
+    else:
+        all_cuts = None
+
+    if all_cuts is None:
+        cmd = [
+            sys.executable, str(HERE / "helpers" / "detect_shots.py"),
+            str(p), "--edit-dir", str(EDIT_DIR), "--threshold", str(threshold),
+        ]
+        if force:
+            cmd.append("--force")
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        )
+        await proc.communicate()
+        if cache_path.exists():
+            all_cuts = json.loads(cache_path.read_text())["cuts"]
+        else:
+            all_cuts = [{"time": 0.0, "score": 100.0}]
+
+    cuts_in_range = [c for c in all_cuts if start - 0.1 <= c["time"] <= end + 0.1]
+    return JSONResponse({"cuts": cuts_in_range, "source": str(p)})
+
+
+# ── API: set per-range sub-shot crop ───────────────────────────────────────────
+
+@app.post("/api/set_sub_crop")
+async def api_set_sub_crop(request: Request):
+    """Write x_crop for a specific sub-shot (by offset from range start) in an EDL range."""
+    body = await request.json()
+    range_index = int(body["range_index"])
+    offset = round(float(body["offset"]), 4)
+    x_crop = max(0.0, min(1.0, float(body["x_crop"])))
+
+    edl_path = EDIT_DIR / "edl.json"
+    if not edl_path.exists():
+        raise HTTPException(status_code=400, detail="edl.json not found")
+
+    async with aiofiles.open(edl_path) as f:
+        edl = json.loads(await f.read())
+
+    ranges = edl.get("ranges", [])
+    if range_index < 0 or range_index >= len(ranges):
+        raise HTTPException(status_code=400, detail="range_index out of bounds")
+
+    sub_crops = ranges[range_index].get("sub_crops") or []
+    # Upsert by offset (within 50ms tolerance)
+    updated = False
+    for sc in sub_crops:
+        if abs(sc["offset"] - offset) < 0.05:
+            sc["x_crop"] = round(x_crop, 4)
+            updated = True
+            break
+    if not updated:
+        sub_crops.append({"offset": offset, "x_crop": round(x_crop, 4)})
+    sub_crops.sort(key=lambda s: s["offset"])
+    ranges[range_index]["sub_crops"] = sub_crops
+
+    async with aiofiles.open(edl_path, "w") as f:
+        await f.write(json.dumps(edl, indent=2))
+
+    return JSONResponse({"ok": True, "range_index": range_index, "sub_crops": sub_crops})
+
+
 # ── API: export Resolve package ────────────────────────────────────────────────
 
 @app.post("/api/export")
