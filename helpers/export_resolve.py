@@ -251,40 +251,57 @@ def build_package(
 
     shots: list[dict] = []
     timeline_offset = 0.0
+    clip_idx = 0
 
     label = "vertical 9:16" if vertical else "16:9"
-    print(f"extracting {len(ranges)} shot(s) — ProRes 422 HQ {label}, {handle_frames}-frame handles → {folder_name}/")
+    print(f"extracting {len(ranges)} range(s) — ProRes 422 HQ {label}, {handle_frames}-frame handles → {folder_name}/")
     for i, r in enumerate(ranges):
         src_name = r["source"]
         meta = src_meta[src_name]
         src_path = meta["path"]
         seg_start = float(r["start"])
         seg_end = float(r["end"])
-        cut_dur = seg_end - seg_start
         beat = r.get("beat") or r.get("note") or ""
-        shot_name = f"shot_{i + 1:02d}_{src_name}"
 
-        crop = None
+        # Build sub-segments: split at sub_crops boundaries when vertical, else whole range
+        sub_segs: list[tuple[float, float, float]] = []  # (start, end, x_crop)
         if vertical:
-            x_crop = float(r.get("x_crop", 0.5))
-            crop = vertical_crop_params(meta["w"], meta["h"], x_crop)
+            sub_crops = r.get("sub_crops") or []
+            if len(sub_crops) > 1:
+                sub_crops_sorted = sorted(sub_crops, key=lambda c: c["offset"])
+                for j, sc in enumerate(sub_crops_sorted):
+                    ss = seg_start + sc["offset"]
+                    se = seg_start + sub_crops_sorted[j + 1]["offset"] if j + 1 < len(sub_crops_sorted) else seg_end
+                    sub_segs.append((ss, se, float(sc["x_crop"])))
+            else:
+                x_crop = float((sub_crops[0]["x_crop"] if sub_crops else r.get("x_crop", 0.5)))
+                sub_segs.append((seg_start, seg_end, x_crop))
+        else:
+            sub_segs.append((seg_start, seg_end, 0.5))
 
-        out_path = shots_dir / f"{shot_name}.mov"
-        print(f"  [{i + 1:02d}] {src_name}  {seg_start:.2f}-{seg_end:.2f}  ({cut_dur:.2f}s)  {beat}")
+        for j, (ss, se, x_crop) in enumerate(sub_segs):
+            clip_idx += 1
+            cut_dur = se - ss
+            suffix = f"_s{j + 1:02d}" if len(sub_segs) > 1 else ""
+            shot_name = f"shot_{clip_idx:02d}_{src_name}{suffix}"
+            crop = vertical_crop_params(meta["w"], meta["h"], x_crop) if vertical else None
+            out_path = shots_dir / f"{shot_name}.mov"
+            sub_label = f" sub-shot {j + 1}/{len(sub_segs)}" if len(sub_segs) > 1 else ""
+            print(f"  [{clip_idx:02d}] {src_name}{sub_label}  {ss:.2f}-{se:.2f}  ({cut_dur:.2f}s)  {beat}")
 
-        h_in, h_out = extract_shot_with_handles(
-            src_path, seg_start, seg_end, handle_frames, meta["fps"], meta["duration"],
-            shot_name, out_path, crop=crop,
-        )
-        shots.append({
-            "file": out_path,
-            "seg_start": seg_start,
-            "cut_duration": cut_dur,
-            "h_in": h_in,
-            "h_out": h_out,
-            "timeline_offset": timeline_offset,
-        })
-        timeline_offset += cut_dur
+            h_in, h_out = extract_shot_with_handles(
+                src_path, ss, se, handle_frames, meta["fps"], meta["duration"],
+                shot_name, out_path, crop=crop,
+            )
+            shots.append({
+                "file": out_path,
+                "seg_start": ss,
+                "cut_duration": cut_dur,
+                "h_in": h_in,
+                "h_out": h_out,
+                "timeline_offset": timeline_offset,
+            })
+            timeline_offset += cut_dur
 
     otio_path = shots_dir / "timeline.otio"
     readme_path = shots_dir / "README.txt"
