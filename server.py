@@ -385,10 +385,16 @@ async def api_export(request: Request):
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
     mode = body.get("mode", "normal") if isinstance(body, dict) else "normal"
     vertical = mode == "vertical"
+    split_shots = mode == "shots"
     edl_path = EDIT_DIR / "edl.json"
     if not edl_path.exists():
         raise HTTPException(status_code=400, detail="edl.json not found")
-    zip_name = "resolve_package_vertical.zip" if vertical else "resolve_package.zip"
+    if vertical:
+        zip_name = "resolve_package_vertical.zip"
+    elif split_shots:
+        zip_name = "resolve_package_shots.zip"
+    else:
+        zip_name = "resolve_package.zip"
     zip_path = EDIT_DIR / zip_name
     cmd = [
         sys.executable, str(HERE / "helpers" / "export_resolve.py"),
@@ -396,6 +402,8 @@ async def api_export(request: Request):
     ]
     if vertical:
         cmd.append("--vertical")
+    if split_shots:
+        cmd.append("--split-shots")
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
     )

@@ -222,6 +222,27 @@ def write_readme(shots: list[dict], handle_frames: int, fps: float, out_path: Pa
 # -------- Main orchestrator ---------------------------------------------------
 
 
+def load_shot_cuts(edit_dir: Path, src_stem: str, range_start: float, range_end: float) -> list[float]:
+    """Return shot boundary times within [range_start, range_end] from cached shot file.
+
+    Returns a list of split points *between* the range start and end (exclusive of both
+    endpoints), sorted ascending. Empty list means no intra-range cuts detected.
+    """
+    cache_path = edit_dir / "shots" / f"{src_stem}.json"
+    if not cache_path.exists():
+        return []
+    try:
+        data = json.loads(cache_path.read_text())
+        cuts = data.get("cuts", [])
+        # Keep cuts strictly inside the range (not at the endpoints themselves)
+        return sorted(
+            c["time"] for c in cuts
+            if range_start + 0.1 < c["time"] < range_end - 0.1
+        )
+    except Exception:
+        return []
+
+
 def build_package(
     edl_path: Path,
     handle_frames: int = 25,
@@ -229,10 +250,18 @@ def build_package(
     make_zip: bool = False,
     out_zip: Path | None = None,
     vertical: bool = False,
+    split_shots: bool = False,
 ) -> Path:
     edl = json.loads(edl_path.read_text())
     edit_dir = edl_path.parent
-    folder_name = "resolve_shots_vertical" if vertical else "resolve_shots"
+
+    if vertical:
+        folder_name = "resolve_shots_vertical"
+    elif split_shots:
+        folder_name = "resolve_shots_split"
+    else:
+        folder_name = "resolve_shots"
+
     shots_dir = edit_dir / folder_name
     shots_dir.mkdir(parents=True, exist_ok=True)
 
@@ -253,7 +282,12 @@ def build_package(
     timeline_offset = 0.0
     clip_idx = 0
 
-    label = "vertical 9:16" if vertical else "16:9"
+    if vertical:
+        label = "vertical 9:16"
+    elif split_shots:
+        label = "16:9 split at shot boundaries"
+    else:
+        label = "16:9"
     print(f"extracting {len(ranges)} range(s) — ProRes 422 HQ {label}, {handle_frames}-frame handles → {folder_name}/")
     for i, r in enumerate(ranges):
         src_name = r["source"]
@@ -263,9 +297,10 @@ def build_package(
         seg_end = float(r["end"])
         beat = r.get("beat") or r.get("note") or ""
 
-        # Build sub-segments: split at sub_crops boundaries when vertical, else whole range
-        sub_segs: list[tuple[float, float, float]] = []  # (start, end, x_crop)
+        # Build sub-segments list: (start, end, x_crop)
+        sub_segs: list[tuple[float, float, float]] = []
         if vertical:
+            # Split at sub_crops boundaries, each with its own x_crop
             sub_crops = r.get("sub_crops") or []
             if len(sub_crops) > 1:
                 sub_crops_sorted = sorted(sub_crops, key=lambda c: c["offset"])
@@ -274,8 +309,15 @@ def build_package(
                     se = seg_start + sub_crops_sorted[j + 1]["offset"] if j + 1 < len(sub_crops_sorted) else seg_end
                     sub_segs.append((ss, se, float(sc["x_crop"])))
             else:
-                x_crop = float((sub_crops[0]["x_crop"] if sub_crops else r.get("x_crop", 0.5)))
+                x_crop = float(sub_crops[0]["x_crop"] if sub_crops else r.get("x_crop", 0.5))
                 sub_segs.append((seg_start, seg_end, x_crop))
+        elif split_shots:
+            # Split at detected shot boundaries from cached scdet results
+            src_path_for_shots = meta["path"]
+            cut_times = load_shot_cuts(edit_dir, src_path_for_shots.stem, seg_start, seg_end)
+            boundaries = [seg_start] + cut_times + [seg_end]
+            for j in range(len(boundaries) - 1):
+                sub_segs.append((boundaries[j], boundaries[j + 1], 0.5))
         else:
             sub_segs.append((seg_start, seg_end, 0.5))
 
@@ -315,7 +357,12 @@ def build_package(
 
     if make_zip:
         if out_zip is None:
-            zip_name = "resolve_package_vertical.zip" if vertical else "resolve_package.zip"
+            if vertical:
+                zip_name = "resolve_package_vertical.zip"
+            elif split_shots:
+                zip_name = "resolve_package_shots.zip"
+            else:
+                zip_name = "resolve_package.zip"
             out_zip = edit_dir / zip_name
         with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
             for shot in shots:
@@ -355,6 +402,10 @@ def main() -> None:
         "--vertical", action="store_true",
         help="Bake 9:16 crop (x_crop per range) into each clip for vertical delivery",
     )
+    ap.add_argument(
+        "--split-shots", action="store_true",
+        help="Split each range at detected shot boundaries (reads edit/shots/ cache)",
+    )
     args = ap.parse_args()
 
     edl_path = args.edl.resolve()
@@ -369,6 +420,7 @@ def main() -> None:
         make_zip=args.zip,
         out_zip=out_zip,
         vertical=args.vertical,
+        split_shots=args.split_shots,
     )
 
 

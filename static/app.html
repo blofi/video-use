@@ -517,6 +517,7 @@ body {
     <button class="btn btn-blue" id="render-final-btn" disabled>Render Final</button>
     <button class="btn btn-green" id="render-vertical-btn" disabled>Render Vertical</button>
     <button class="btn btn-accent" id="export-btn" disabled>Export for Resolve</button>
+    <button class="btn btn-accent" id="export-shots-btn" disabled>Export Shots for Resolve</button>
     <button class="btn btn-accent" id="export-vertical-btn" disabled>Export for Resolve (Vertical)</button>
   </div>
 </div>
@@ -608,6 +609,7 @@ const renderPreviewBtn   = document.getElementById('render-preview-btn');
 const renderFinalBtn     = document.getElementById('render-final-btn');
 const renderVerticalBtn  = document.getElementById('render-vertical-btn');
 const exportBtn          = document.getElementById('export-btn');
+const exportShotsBtn     = document.getElementById('export-shots-btn');
 const exportVerticalBtn  = document.getElementById('export-vertical-btn');
 
 const cropModal    = document.getElementById('crop-modal');
@@ -903,6 +905,7 @@ async function loadProject() {
     renderPreviewBtn.disabled = !hasEdl;
     renderVerticalBtn.disabled = !hasEdl;
     exportBtn.disabled = !data.final_available;
+    exportShotsBtn.disabled = !hasEdl;
     exportVerticalBtn.disabled = !hasEdl;
 
     // Show transcribe button only when clips exist but no transcript yet
@@ -1040,29 +1043,35 @@ renderFinalBtn.addEventListener('click', async () => {
   }
 });
 
-async function runExport(vertical) {
-  const btn = vertical ? exportVerticalBtn : exportBtn;
-  const label = vertical ? 'Export for Resolve (Vertical)' : 'Export for Resolve';
-  const zipName = vertical ? 'resolve_package_vertical.zip' : 'resolve_package.zip';
+async function runExport(mode) {
+  // mode: 'normal' | 'shots' | 'vertical'
+  const btns = { normal: exportBtn, shots: exportShotsBtn, vertical: exportVerticalBtn };
+  const labels = { normal: 'Export for Resolve', shots: 'Export Shots for Resolve', vertical: 'Export for Resolve (Vertical)' };
+  const zips  = { normal: 'resolve_package.zip', shots: 'resolve_package_shots.zip', vertical: 'resolve_package_vertical.zip' };
+  const btn = btns[mode];
   btn.disabled = true;
   btn.textContent = 'Exporting…';
   try {
-    const body = vertical ? JSON.stringify({mode: 'vertical'}) : '{}';
-    const res = await fetch('/api/export', { method: 'POST', headers: {'Content-Type': 'application/json'}, body });
+    const res = await fetch('/api/export', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({mode}),
+    });
     if (!res.ok) { const e = await res.json(); alert(e.detail); return; }
     const data = await res.json();
     const a = document.createElement('a');
     a.href = `/edit/${data.path.replace('edit/', '')}`;
-    a.download = zipName;
+    a.download = zips[mode];
     a.click();
   } finally {
-    btn.textContent = label;
+    btn.textContent = labels[mode];
     btn.disabled = false;
   }
 }
 
-exportBtn.addEventListener('click', () => runExport(false));
-exportVerticalBtn.addEventListener('click', () => runExport(true));
+exportBtn.addEventListener('click', () => runExport('normal'));
+exportShotsBtn.addEventListener('click', () => runExport('shots'));
+exportVerticalBtn.addEventListener('click', () => runExport('vertical'));
 
 // ── Render Vertical ────────────────────────────────────────────────────────
 renderVerticalBtn.addEventListener('click', async () => {
