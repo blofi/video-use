@@ -16,11 +16,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-DEFAULT_THRESHOLD = 10.0   # scdet score 0–100; ~10 works well for broadcast footage
+DEFAULT_THRESHOLD = 5.0    # scdet score 0–100; ~5 catches broadcast hard-cuts reliably
 
-# Matches lines like:
-# [scdet @ ptr] frame:73 pts:73 pts_time:2.43333 lavfi.scd.score:14.47 lavfi.scd.time:2.43333
-_CUT_RE = re.compile(r"pts_time:([\d.]+).*?lavfi\.scd\.score:([\d.]+)")
+# ffmpeg scdet logs cut frames like:
+# [scdet @ ptr] frame:73 pts:73 pts_time:2.43333 lavfi.scd.score: 14.47 lavfi.scd.time: 2.43333
+# Note the space after the colon — \s* handles both formats.
+_CUT_RE = re.compile(r"pts_time:\s*([\d.]+).*?lavfi\.scd\.score:\s*([\d.]+)")
 
 
 def detect_shots(

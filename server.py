@@ -295,7 +295,7 @@ async def api_set_crop(request: Request):
 
 @app.get("/api/shots")
 async def api_shots(source: str, start: float = 0.0, end: float = 1e9,
-                    threshold: float = 10.0, force: bool = False):
+                    threshold: float = 5.0, force: bool = False):
     """Return shot cut timestamps within [start, end] for a source file."""
     p = resolve_source_path(source)
     if not p.exists() or not p.is_file():
