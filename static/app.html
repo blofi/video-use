@@ -534,7 +534,6 @@ body {
     <button class="btn btn-ghost" id="render-preview-btn" disabled>Preview</button>
     <button class="btn btn-blue" id="render-final-btn" disabled>Render Final</button>
     <button class="btn btn-green" id="render-vertical-btn" disabled>Render Vertical</button>
-    <button class="btn btn-accent" id="export-btn" disabled>Export for Resolve</button>
     <button class="btn btn-accent" id="export-shots-btn" disabled>Export Shots for Resolve</button>
     <button class="btn btn-accent" id="export-vertical-btn" disabled>Export for Resolve (Vertical)</button>
   </div>
@@ -627,7 +626,6 @@ const transcribeBtn      = document.getElementById('transcribe-btn');
 const renderPreviewBtn   = document.getElementById('render-preview-btn');
 const renderFinalBtn     = document.getElementById('render-final-btn');
 const renderVerticalBtn  = document.getElementById('render-vertical-btn');
-const exportBtn          = document.getElementById('export-btn');
 const exportShotsBtn     = document.getElementById('export-shots-btn');
 const exportVerticalBtn  = document.getElementById('export-vertical-btn');
 
@@ -995,7 +993,6 @@ async function loadProject() {
     renderPreviewBtn.disabled = !hasEdl;
     renderVerticalBtn.disabled = !hasEdl;
     graticuleBtn.disabled = !hasEdl;
-    exportBtn.disabled = !data.final_available;
     exportShotsBtn.disabled = !hasEdl;
     exportVerticalBtn.disabled = !hasEdl;
     if (graticuleEnabled) updateGraticule(player.currentTime);
@@ -1136,10 +1133,10 @@ renderFinalBtn.addEventListener('click', async () => {
 });
 
 async function runExport(mode) {
-  // mode: 'normal' | 'shots' | 'vertical'
-  const btns = { normal: exportBtn, shots: exportShotsBtn, vertical: exportVerticalBtn };
-  const labels = { normal: 'Export for Resolve', shots: 'Export Shots for Resolve', vertical: 'Export for Resolve (Vertical)' };
-  const zips  = { normal: 'resolve_package.zip', shots: 'resolve_package_shots.zip', vertical: 'resolve_package_vertical.zip' };
+  // mode: 'shots' | 'vertical'
+  const btns = { shots: exportShotsBtn, vertical: exportVerticalBtn };
+  const labels = { shots: 'Export Shots for Resolve', vertical: 'Export for Resolve (Vertical)' };
+  const zips  = { shots: 'resolve_package_shots.zip', vertical: 'resolve_package_vertical.zip' };
   const btn = btns[mode];
   btn.disabled = true;
   btn.textContent = 'Exporting…';
@@ -1161,7 +1158,6 @@ async function runExport(mode) {
   }
 }
 
-exportBtn.addEventListener('click', () => runExport('normal'));
 exportShotsBtn.addEventListener('click', () => runExport('shots'));
 exportVerticalBtn.addEventListener('click', () => runExport('vertical'));
 
