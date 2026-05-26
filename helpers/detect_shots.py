@@ -18,11 +18,10 @@ from pathlib import Path
 
 DEFAULT_THRESHOLD = 5.0    # scdet score 0–100; ~5 catches broadcast hard-cuts reliably
 
-# Modern ffmpeg (4+) outputs one line per detected cut:
-# [Parsed_scdet_0 @ ptr] lavfi.scd.score: 14.47  lavfi.scd.time: 2.43333
-# Older builds may also prefix with frame/pts_time on the same or preceding line;
-# we extract time from lavfi.scd.time (present in all versions).
-_CUT_RE = re.compile(r"lavfi\.scd\.score:\s*([\d.]+)\s+lavfi\.scd\.time:\s*([\d.]+)")
+# ffmpeg scdet outputs one line per detected cut (comma-separated on macOS builds):
+# [scdet @ ptr] lavfi.scd.score: 33.337, lavfi.scd.time: 3.84
+# Some builds omit the comma; the regex accepts both.
+_CUT_RE = re.compile(r"lavfi\.scd\.score:\s*([\d.]+),?\s+lavfi\.scd\.time:\s*([\d.]+)")
 
 
 def detect_shots(
