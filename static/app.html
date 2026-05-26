@@ -646,6 +646,8 @@ let cropRangeIndex = -1;
 let cropXCrop = 0.5;
 let cropSubOffset = 0.0;    // source offset from range start of active sub-shot
 let cropSubDuration = null; // duration of active sub-shot (null = whole range)
+let cropDirty = false;      // true once the user has dragged in the current sub-shot
+let pendingCrops = {};      // rangeIndex → { "offset" → x_crop } — unsaved changes across sub-shots
 let segmentShots = {};      // rangeIndex → [{time, score}]
 let shotThreshold = 10;     // current scdet threshold
 const imgModal         = document.getElementById('img-modal');
@@ -1192,15 +1194,34 @@ renderVerticalBtn.addEventListener('click', async () => {
 // = container_W * (src_h * 9/16) / src_w = container_W * (9/16) / (16/9) = container_W * 81/256
 const CROP_RECT_FRACTION = 81 / 256; // ≈ 0.3164
 
+// Stash the current sub-shot's drag position in the pending map (only when dragged)
+function saveCurrentToPending() {
+  if (!cropDirty) return;
+  if (!pendingCrops[cropRangeIndex]) pendingCrops[cropRangeIndex] = {};
+  pendingCrops[cropRangeIndex][cropSubOffset.toFixed(4)] = cropXCrop;
+  cropDirty = false;
+}
+
+// Resolve x_crop for a given sub-shot offset: pending > saved sub_crop > range x_crop > 0.5
+function resolveXCrop(seg, offset) {
+  const pending = pendingCrops[seg._rangeIndex || cropRangeIndex];
+  if (pending && pending[offset.toFixed(4)] != null) return pending[offset.toFixed(4)];
+  const subCrops = seg.sub_crops || [];
+  const saved = subCrops.find(sc => Math.abs(sc.offset - offset) < 0.05);
+  return saved ? saved.x_crop : (seg.x_crop != null ? seg.x_crop : 0.5);
+}
+
 function openCropEditor(seg, rangeIndex, subOffset, subDuration) {
   cropRangeIndex = rangeIndex;
   cropSubOffset = subOffset != null ? subOffset : 0.0;
   cropSubDuration = subDuration != null ? subDuration : (seg.end - seg.start);
+  cropDirty = false;
 
-  // Find saved x_crop: check sub_crops first, fall back to range x_crop
-  const subCrops = seg.sub_crops || [];
-  const saved = subCrops.find(sc => Math.abs(sc.offset - cropSubOffset) < 0.05);
-  cropXCrop = saved ? saved.x_crop : (seg.x_crop != null ? seg.x_crop : 0.5);
+  // Store rangeIndex on seg so resolveXCrop can use it when called from pill handlers
+  seg._rangeIndex = rangeIndex;
+
+  // Find x_crop: pending map > saved sub_crops > range x_crop
+  cropXCrop = resolveXCrop(seg, cropSubOffset);
 
   // Load frame at midpoint of the active sub-shot
   const frameT = seg.start + cropSubOffset + cropSubDuration / 2;
@@ -1241,10 +1262,13 @@ function buildSubShotStrip(seg, rangeIndex) {
     if (hasCrop) pill.textContent += ' ·';
 
     pill.addEventListener('click', () => {
+      // Save current sub-shot position before switching
+      saveCurrentToPending();
       cropSubOffset = offset;
       cropSubDuration = dur;
-      const saved = subCrops.find(sc => Math.abs(sc.offset - offset) < 0.05);
-      cropXCrop = saved ? saved.x_crop : (seg.x_crop != null ? seg.x_crop : 0.5);
+      cropDirty = false;
+      // Load from pending map first, then saved, then default
+      cropXCrop = resolveXCrop(seg, offset);
 
       const frameT = seg.start + offset + dur / 2;
       cropFrameImg.src = `/api/frame?source=${encodeURIComponent(seg._sourcePath || '')}&t=${frameT.toFixed(3)}`;
@@ -1289,30 +1313,50 @@ cropFrameWrap.addEventListener('pointermove', e => {
   if (maxLeft <= 0) return;
   const dx = e.clientX - _dragStartX;
   cropXCrop = Math.max(0, Math.min(1, _dragStartCrop + dx / maxLeft));
+  cropDirty = true;
   updateCropOverlay();
 });
 
 cropFrameWrap.addEventListener('pointerup', () => { _dragging = false; });
 
 cropCancelBtn.addEventListener('click', () => {
+  delete pendingCrops[cropRangeIndex];
+  cropDirty = false;
   cropModal.classList.remove('open');
 });
 
 cropSetBtn.addEventListener('click', async () => {
   try {
-    const xCrop = Math.round(cropXCrop * 10000) / 10000;
-    // If a specific sub-shot is selected (offset > 0 or strip visible), use set_sub_crop
     const useSubCrop = subShotStrip.classList.contains('visible');
-    const url = useSubCrop ? '/api/set_sub_crop' : '/api/set_crop';
-    const body = useSubCrop
-      ? { range_index: cropRangeIndex, offset: cropSubOffset, x_crop: xCrop }
-      : { range_index: cropRangeIndex, x_crop: xCrop };
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) { const e = await res.json(); alert(e.detail); return; }
+    if (useSubCrop) {
+      // Stash the current sub-shot, then commit everything in the pending map
+      saveCurrentToPending();
+      const pending = pendingCrops[cropRangeIndex] || {};
+      const entries = Object.entries(pending);
+      if (entries.length === 0) { cropModal.classList.remove('open'); return; }
+      for (const [offsetStr, xCropVal] of entries) {
+        const res = await fetch('/api/set_sub_crop', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            range_index: cropRangeIndex,
+            offset: parseFloat(offsetStr),
+            x_crop: Math.round(xCropVal * 10000) / 10000,
+          }),
+        });
+        if (!res.ok) { const e = await res.json(); alert(e.detail); return; }
+      }
+      delete pendingCrops[cropRangeIndex];
+    } else {
+      const xCrop = Math.round(cropXCrop * 10000) / 10000;
+      const res = await fetch('/api/set_crop', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ range_index: cropRangeIndex, x_crop: xCrop }),
+      });
+      if (!res.ok) { const e = await res.json(); alert(e.detail); return; }
+    }
+    cropDirty = false;
     cropModal.classList.remove('open');
     loadProject();
   } catch (err) {
