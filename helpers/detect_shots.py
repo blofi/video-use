@@ -16,7 +16,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-DEFAULT_THRESHOLD = 5.0    # scdet score 0–100; ~5 catches broadcast hard-cuts reliably
+DEFAULT_THRESHOLD = 10.0   # scdet score 0–100; ~10 catches broadcast hard-cuts; raise to reduce false positives
+MIN_CUT_GAP = 0.5          # seconds — deduplicate detections within the same cut (keep highest score)
 
 # ffmpeg scdet outputs one line per detected cut (comma-separated on macOS builds):
 # [scdet @ ptr] lavfi.scd.score: 33.337, lavfi.scd.time: 3.84
@@ -54,16 +55,27 @@ def detect_shots(
     )
     # scdet logs cut frames on stderr regardless of return code (null muxer = exit 0)
 
-    cuts: list[dict] = [{"time": 0.0, "score": 100.0}]  # always include first shot
+    raw: list[dict] = []
     for line in result.stderr.splitlines():
         m = _CUT_RE.search(line)
         if m:
             score = round(float(m.group(1)), 2)
             t = round(float(m.group(2)), 4)
             if t > 0.05:  # skip near-zero detections (codec artefacts at open)
-                cuts.append({"time": t, "score": score})
+                raw.append({"time": t, "score": score})
 
-    cuts.sort(key=lambda c: c["time"])
+    raw.sort(key=lambda c: c["time"])
+
+    # Deduplicate: within MIN_CUT_GAP seconds, keep the highest-scoring detection
+    deduped: list[dict] = []
+    for cut in raw:
+        if deduped and cut["time"] - deduped[-1]["time"] < MIN_CUT_GAP:
+            if cut["score"] > deduped[-1]["score"]:
+                deduped[-1] = cut  # replace with higher-scoring neighbour
+        else:
+            deduped.append(cut)
+
+    cuts: list[dict] = [{"time": 0.0, "score": 100.0}] + deduped  # always include first shot
 
     cache_path.write_text(json.dumps({
         "source": str(source),

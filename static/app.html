@@ -312,7 +312,18 @@ body {
   text-transform: uppercase;
   color: var(--muted);
   margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
+#shot-threshold-wrap {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  font-weight: 400;
+  letter-spacing: 0;
+}
+#shot-threshold-wrap.visible { display: flex; }
 #timeline-track {
   display: flex;
   gap: 3px;
@@ -537,7 +548,14 @@ body {
       </div>
     </div>
     <div id="timeline-section">
-      <div id="timeline-header">Shot timeline</div>
+      <div id="timeline-header">
+        Shot timeline
+        <span id="shot-threshold-wrap" title="Shot detection sensitivity. Lower = more cuts detected; raise to reduce false positives.">
+          cuts&nbsp;sensitivity
+          <input type="range" id="shot-threshold" min="3" max="40" step="1" value="10" style="width:80px;vertical-align:middle;cursor:pointer;">
+          <span id="shot-threshold-val">10</span>
+        </span>
+      </div>
       <div id="timeline-track"><span id="timeline-empty">No cut yet — the timeline will appear after the first render.</span></div>
     </div>
   </div>
@@ -580,6 +598,9 @@ const sendBtn     = document.getElementById('send-btn');
 const player      = document.getElementById('player');
 const playerPlaceholder = document.getElementById('player-placeholder');
 const timelineTrack = document.getElementById('timeline-track');
+const shotThresholdSlider = document.getElementById('shot-threshold');
+const shotThresholdVal    = document.getElementById('shot-threshold-val');
+const shotThresholdWrap   = document.getElementById('shot-threshold-wrap');
 const projPathEl  = document.getElementById('proj-path');
 const transcribeBtn      = document.getElementById('transcribe-btn');
 const renderPreviewBtn   = document.getElementById('render-preview-btn');
@@ -599,6 +620,7 @@ let cropXCrop = 0.5;
 let cropSubOffset = 0.0;    // source offset from range start of active sub-shot
 let cropSubDuration = null; // duration of active sub-shot (null = whole range)
 let segmentShots = {};      // rangeIndex → [{time, score}]
+let shotThreshold = 10;     // current scdet threshold
 const imgModal         = document.getElementById('img-modal');
 const modalImg         = document.getElementById('modal-img');
 
@@ -802,31 +824,22 @@ function buildTimeline(edl, projectSources) {
   });
 
   // Fetch shot boundaries asynchronously and inject tick marks
+  shotThresholdWrap.classList.add('visible');
   loadShotsForAll(segments);
 }
 
-async function loadShotsForAll(segments) {
-  // Track which sources we've already force-busted this session to avoid repeating
-  const forceBusted = new Set();
-  for (let i = 0; i < segments.length; i++) {
-    const seg = segments[i];
+async function loadShotsForAll(segments, force) {
+  const segs = segments || currentSegments;
+  for (let i = 0; i < segs.length; i++) {
+    const seg = segs[i];
     if (!seg._sourcePath) continue;
     try {
-      const url = `/api/shots?source=${encodeURIComponent(seg._sourcePath)}&start=${seg.start}&end=${seg.end}`;
-      let res = await fetch(url);
+      let url = `/api/shots?source=${encodeURIComponent(seg._sourcePath)}&start=${seg.start}&end=${seg.end}&threshold=${shotThreshold}`;
+      if (force) url += '&force=true';
+      const res = await fetch(url);
       if (!res.ok) continue;
-      let data = await res.json();
-      let cuts = data.cuts || [];
-      // If only the t=0 sentinel came back and we haven't force-busted this source yet,
-      // the cache may be stale from before the regex fix — re-run with force=true once.
-      if (cuts.length <= 1 && !forceBusted.has(seg._sourcePath)) {
-        forceBusted.add(seg._sourcePath);
-        const forceRes = await fetch(url + '&force=true');
-        if (forceRes.ok) {
-          const forceData = await forceRes.json();
-          cuts = forceData.cuts || cuts;
-        }
-      }
+      const data = await res.json();
+      const cuts = data.cuts || [];
       segmentShots[i] = cuts;
       injectTicks(i, seg, cuts);
     } catch (_) { /* non-critical, skip silently */ }
@@ -1203,6 +1216,22 @@ new ResizeObserver(() => { if (cropModal.classList.contains('open')) updateCropO
 
 // ── Image modal ────────────────────────────────────────────────────────────
 imgModal.addEventListener('click', () => imgModal.classList.remove('open'));
+
+// ── Shot threshold slider ──────────────────────────────────────────────────
+let _thresholdDebounce = null;
+shotThresholdSlider.addEventListener('input', () => {
+  shotThreshold = parseInt(shotThresholdSlider.value, 10);
+  shotThresholdVal.textContent = shotThreshold;
+});
+shotThresholdSlider.addEventListener('change', () => {
+  // On release: clear existing ticks and re-fetch with force=true
+  clearTimeout(_thresholdDebounce);
+  _thresholdDebounce = setTimeout(() => {
+    timelineTrack.querySelectorAll('.shot-tick').forEach(t => t.remove());
+    segmentShots = {};
+    loadShotsForAll(null, true);
+  }, 200);
+});
 
 // ── Init ───────────────────────────────────────────────────────────────────
 connect();
