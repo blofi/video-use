@@ -647,15 +647,23 @@ def build_final_composite(
     subtitles_path: Path | None,
     out_path: Path,
     edit_dir: Path,
+    vo_track: dict | None = None,
 ) -> None:
     """Final pass: base → overlays (PTS-shifted) → subtitles LAST → out.
 
-    If there are no overlays and no subtitles, just copy base to out.
+    If there are no overlays, no subtitles, and no vo_track, just copy base to out.
+    When vo_track is provided, the pre-timed vo_clean.wav is mixed under the video
+    audio via amix. The WAV must already have silence at grab/PTC positions so it
+    aligns 1:1 with the output timeline (produced by helpers/cut_vo.py).
     """
     has_overlays = bool(overlays)
     has_subs = subtitles_path is not None and subtitles_path.exists()
+    has_vo = bool(vo_track)
+    if has_vo:
+        vo_path = resolve_path(vo_track["file"], edit_dir)
+        has_vo = vo_path.exists()
 
-    if not has_overlays and not has_subs:
+    if not has_overlays and not has_subs and not has_vo:
         # Nothing to do — just rename/copy base to final name
         run(["ffmpeg", "-y", "-i", str(base_path), "-c", "copy", str(out_path)], quiet=True)
         return
@@ -664,6 +672,11 @@ def build_final_composite(
     for ov in overlays:
         ov_path = resolve_path(ov["file"], edit_dir)
         inputs += ["-i", str(ov_path)]
+
+    vo_input_idx: int | None = None
+    if has_vo:
+        inputs += ["-i", str(vo_path)]
+        vo_input_idx = 1 + len(overlays)
 
     filter_parts: list[str] = []
     # PTS-shift every overlay so its frame 0 lands at start_in_output
@@ -691,12 +704,29 @@ def build_final_composite(
         )
         out_label = "[outv]"
     else:
-        # Rename the last overlay output to [outv] for consistency
         if has_overlays:
             filter_parts.append(f"{current}null[outv]")
             out_label = "[outv]"
+        elif has_vo:
+            # No overlays/subs but VO present — need a passthrough for video
+            filter_parts.append(f"[0:v]null[outv]")
+            out_label = "[outv]"
         else:
             out_label = "[0:v]"
+
+    # VO audio mix — amix base audio with the pre-timed VO WAV
+    if has_vo:
+        vol = float(vo_track.get("vol", 1.0))
+        filter_parts.append(
+            f"[0:a]volume=1.0[base_a];"
+            f"[{vo_input_idx}:a]volume={vol:.3f}[vo_a];"
+            f"[base_a][vo_a]amix=inputs=2:duration=longest:dropout_transition=0[aout]"
+        )
+        audio_map = ["-map", "[aout]"]
+        audio_codec = ["-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
+    else:
+        audio_map = ["-map", "0:a"]
+        audio_codec = ["-c:a", "copy"]
 
     filter_complex = ";".join(filter_parts)
 
@@ -705,15 +735,15 @@ def build_final_composite(
         *inputs,
         "-filter_complex", filter_complex,
         "-map", out_label,
-        "-map", "0:a",
+        *audio_map,
         "-c:v", "libx264", "-preset", "fast", "-crf", "18",
         "-pix_fmt", "yuv420p",
-        "-c:a", "copy",
+        *audio_codec,
         "-movflags", "+faststart",
         str(out_path),
     ]
     print(f"compositing → {out_path.name}")
-    print(f"  overlays: {len(overlays)}, subtitles: {'yes' if has_subs else 'no'}")
+    print(f"  overlays: {len(overlays)}, subtitles: {'yes' if has_subs else 'no'}, vo_track: {'yes' if has_vo else 'no'}")
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
@@ -805,13 +835,14 @@ def main() -> None:
 
     # 4. Composite (overlays + subtitles LAST) → intermediate (pre-loudnorm) path
     overlays = edl.get("overlays") or []
+    vo_track = edl.get("vo_track") or None
     if args.no_loudnorm:
         # Composite directly to final output
-        build_final_composite(base_path, overlays, subs_path, out_path, edit_dir)
+        build_final_composite(base_path, overlays, subs_path, out_path, edit_dir, vo_track=vo_track)
     else:
         # Composite to a temp file, then run loudnorm → final output
         tmp_composite = out_path.with_suffix(".prenorm.mp4")
-        build_final_composite(base_path, overlays, subs_path, tmp_composite, edit_dir)
+        build_final_composite(base_path, overlays, subs_path, tmp_composite, edit_dir, vo_track=vo_track)
         print("loudness normalization → social-ready (-14 LUFS / -1 dBTP / LRA 11)")
         apply_loudnorm_two_pass(tmp_composite, out_path, preview=args.draft)
         tmp_composite.unlink(missing_ok=True)

@@ -375,6 +375,43 @@ TOOLS = [
         "description": "Return the full contents of takes_packed.md. Use this to read the transcript before making cut decisions.",
         "input_schema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "clean_vo",
+        "description": (
+            "Read the raw voiceover transcript for a WAV/audio file and return the word-level text. "
+            "Transcribes first if no cached transcript exists. "
+            "Returns the raw transcript so you can tidy it (remove stumbles, fillers, false starts, "
+            "fix grammar) and present the cleaned script to the user for review. "
+            "Do NOT call cut_vo until the user has approved or edited the script."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "source_path": {"type": "string", "description": "Absolute path to the WAV or audio file"},
+            },
+            "required": ["source_path"],
+        },
+    },
+    {
+        "name": "cut_vo",
+        "description": (
+            "Splice a voiceover WAV to match an approved script. "
+            "Aligns the script against the word-level transcript, extracts matching segments with 30ms crossfade joins, "
+            "and inserts silence at grab/PTC ranges so the output WAV aligns with the output timeline. "
+            "Writes edit/vo_clean.wav and edit/vo_words.json. "
+            "Call ONLY after the user has approved the script from clean_vo. "
+            "Set use_edl=true when the edit contains grabs or PTCs (recommended)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "source_path": {"type": "string", "description": "Absolute path to the original WAV file"},
+                "script": {"type": "string", "description": "The approved/edited script text"},
+                "use_edl": {"type": "boolean", "description": "Read current edl.json for grab/PTC silence insertion (default true)"},
+            },
+            "required": ["source_path", "script"],
+        },
+    },
 ]
 
 
@@ -384,6 +421,71 @@ async def _run_tool(name: str, tool_input: dict, ws: WebSocket) -> str:
         if packed.exists():
             return packed.read_text()
         return "No transcript found. Call run_transcribe first."
+
+    if name == "clean_vo":
+        source_path = Path(str(resolve_source_path(tool_input["source_path"])))
+        stem = source_path.stem
+        transcript_path = EDIT_DIR / "transcripts" / f"{stem}.json"
+        if not transcript_path.exists():
+            await ws.send_json({"type": "tool_progress", "tool": name,
+                                "line": f"No cached transcript — transcribing {source_path.name}…"})
+            cmd = [
+                sys.executable, str(HERE / "helpers" / "transcribe.py"),
+                str(source_path), "--edit-dir", str(EDIT_DIR),
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+            )
+            lines: list[str] = []
+            async for line in proc.stdout:
+                text = line.decode(errors="replace").rstrip()
+                lines.append(text)
+                await ws.send_json({"type": "tool_progress", "tool": name, "line": text})
+            await proc.wait()
+            if proc.returncode != 0:
+                return "Transcription failed:\n" + "\n".join(lines[-10:])
+        raw = json.loads(transcript_path.read_text())
+        words = [w for w in raw.get("words", []) if w.get("type") == "word"]
+        raw_text = " ".join(w.get("text", "").strip() for w in words if w.get("text", "").strip())
+        return (
+            f"Raw transcript for {source_path.name} ({len(words)} words):\n\n"
+            f"{raw_text}\n\n"
+            "Tidy this transcript (remove stumbles, false starts, fillers; fix grammar) "
+            "and present the cleaned script to the user for review before calling cut_vo."
+        )
+
+    if name == "cut_vo":
+        source_path = str(resolve_source_path(tool_input["source_path"]))
+        script = tool_input["script"]
+        use_edl = tool_input.get("use_edl", True)
+        cmd = [
+            sys.executable, str(HERE / "helpers" / "cut_vo.py"),
+            source_path,
+            "--script", script,
+            "--edit-dir", str(EDIT_DIR),
+            "--out-wav", str(EDIT_DIR / "vo_clean.wav"),
+            "--out-words", str(EDIT_DIR / "vo_words.json"),
+        ]
+        if use_edl:
+            edl_p = EDIT_DIR / "edl.json"
+            if edl_p.exists():
+                cmd += ["--edl", str(edl_p)]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        )
+        lines: list[str] = []
+        async for line in proc.stdout:
+            text = line.decode(errors="replace").rstrip()
+            lines.append(text)
+            await ws.send_json({"type": "tool_progress", "tool": name, "line": text})
+        await proc.wait()
+        if proc.returncode != 0:
+            return "cut_vo failed:\n" + "\n".join(lines[-20:])
+        for line in reversed(lines):
+            if line.startswith("RESULT:"):
+                return line[len("RESULT:"):]
+        return "cut_vo complete — edit/vo_clean.wav and edit/vo_words.json written."
+
     if name == "write_edl":
         edl = tool_input["edl"]
         # Always recompute — don't trust the LLM's arithmetic
@@ -512,8 +614,10 @@ def _build_system() -> list[dict]:
         "you already have it. You do NOT need to read any files to access it.\n"
         "- If for any reason you need to re-read the transcript, use the `read_transcript` tool.\n"
         "- Your only tools are: write_edl, render_preview, render_final, render_vertical, run_transcribe, "
-        "timeline_view, read_transcript.\n"
+        "timeline_view, read_transcript, clean_vo, cut_vo.\n"
         "- Use render_vertical to produce a 1080×1920 9:16 social-media version; it honours x_crop on each range.\n"
+        "- VO workflow: call clean_vo on the WAV → tidy the transcript → present to user → user approves → call cut_vo → write_edl with vo_track + audio_mode:sync on grabs/PTCs → render.\n"
+        "- Set audio_mode:'sync' on grab and PTC ranges so camera audio plays there; omit (defaults to 'vo') on B-roll.\n"
         "- Always confirm the editing strategy in plain English before calling write_edl.\n\n"
         f"Videos directory: {VIDEOS_DIR}\nEdit directory: {EDIT_DIR}\n\n"
     )
