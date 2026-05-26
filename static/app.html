@@ -735,11 +735,18 @@ function beatClass(beat) {
 }
 
 // ── Shot timeline ──────────────────────────────────────────────────────────
-function buildTimeline(edl) {
+function buildTimeline(edl, projectSources) {
   if (!edl || !edl.ranges || !edl.ranges.length) return;
 
   const ranges = edl.ranges;
-  const sources = edl.sources || {};
+  // Build source lookup: prefer EDL sources dict, supplement with project sources list
+  const sources = { ...(edl.sources || {}) };
+  (projectSources || []).forEach(s => {
+    // Map by stem (no extension) and full name so LLM short-names resolve
+    const stem = s.name.replace(/\.[^.]+$/, '');
+    if (!sources[s.name]) sources[s.name] = s.path;
+    if (!sources[stem]) sources[stem] = s.path;
+  });
   let offset = 0;
   const segments = ranges.map(r => {
     const dur = Math.max(0.1, r.end - r.start);
@@ -859,7 +866,7 @@ async function loadProject() {
     const res = await fetch('/api/project');
     const data = await res.json();
     projPathEl.textContent = data.videos_dir;
-    if (data.edl) buildTimeline(data.edl);
+    if (data.edl) buildTimeline(data.edl, data.sources);
     if (data.preview_available) {
       loadVideo('edit/preview.mp4');
       renderFinalBtn.disabled = false;
