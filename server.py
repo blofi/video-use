@@ -381,15 +381,21 @@ async def api_set_sub_crop(request: Request):
 # ── API: export Resolve package ────────────────────────────────────────────────
 
 @app.post("/api/export")
-async def api_export():
+async def api_export(request: Request):
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    mode = body.get("mode", "normal") if isinstance(body, dict) else "normal"
+    vertical = mode == "vertical"
     edl_path = EDIT_DIR / "edl.json"
     if not edl_path.exists():
         raise HTTPException(status_code=400, detail="edl.json not found")
-    zip_path = EDIT_DIR / "resolve_package.zip"
+    zip_name = "resolve_package_vertical.zip" if vertical else "resolve_package.zip"
+    zip_path = EDIT_DIR / zip_name
     cmd = [
         sys.executable, str(HERE / "helpers" / "export_resolve.py"),
         str(edl_path), "--zip", "-o", str(zip_path),
     ]
+    if vertical:
+        cmd.append("--vertical")
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
     )
@@ -398,7 +404,8 @@ async def api_export():
         raise HTTPException(status_code=500, detail=stdout.decode(errors="replace"))
     if not zip_path.exists():
         raise HTTPException(status_code=500, detail="Export produced no zip file")
-    return JSONResponse({"path": "edit/resolve_package.zip", "size": zip_path.stat().st_size})
+    rel = f"edit/{zip_name}"
+    return JSONResponse({"path": rel, "size": zip_path.stat().st_size})
 
 
 # ── LLM tool definitions ───────────────────────────────────────────────────────

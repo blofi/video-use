@@ -517,6 +517,7 @@ body {
     <button class="btn btn-blue" id="render-final-btn" disabled>Render Final</button>
     <button class="btn btn-green" id="render-vertical-btn" disabled>Render Vertical</button>
     <button class="btn btn-accent" id="export-btn" disabled>Export for Resolve</button>
+    <button class="btn btn-accent" id="export-vertical-btn" disabled>Export for Resolve (Vertical)</button>
   </div>
 </div>
 
@@ -607,6 +608,7 @@ const renderPreviewBtn   = document.getElementById('render-preview-btn');
 const renderFinalBtn     = document.getElementById('render-final-btn');
 const renderVerticalBtn  = document.getElementById('render-vertical-btn');
 const exportBtn          = document.getElementById('export-btn');
+const exportVerticalBtn  = document.getElementById('export-vertical-btn');
 
 const cropModal    = document.getElementById('crop-modal');
 const cropFrameImg = document.getElementById('crop-frame-img');
@@ -901,6 +903,7 @@ async function loadProject() {
     renderPreviewBtn.disabled = !hasEdl;
     renderVerticalBtn.disabled = !hasEdl;
     exportBtn.disabled = !data.final_available;
+    exportVerticalBtn.disabled = !hasEdl;
 
     // Show transcribe button only when clips exist but no transcript yet
     const needsTranscribe = data.sources.length > 0 && !data.takes_packed;
@@ -1037,22 +1040,29 @@ renderFinalBtn.addEventListener('click', async () => {
   }
 });
 
-exportBtn.addEventListener('click', async () => {
-  exportBtn.disabled = true;
-  exportBtn.textContent = 'Exporting…';
+async function runExport(vertical) {
+  const btn = vertical ? exportVerticalBtn : exportBtn;
+  const label = vertical ? 'Export for Resolve (Vertical)' : 'Export for Resolve';
+  const zipName = vertical ? 'resolve_package_vertical.zip' : 'resolve_package.zip';
+  btn.disabled = true;
+  btn.textContent = 'Exporting…';
   try {
-    const res = await fetch('/api/export', { method: 'POST' });
+    const body = vertical ? JSON.stringify({mode: 'vertical'}) : '{}';
+    const res = await fetch('/api/export', { method: 'POST', headers: {'Content-Type': 'application/json'}, body });
     if (!res.ok) { const e = await res.json(); alert(e.detail); return; }
     const data = await res.json();
     const a = document.createElement('a');
     a.href = `/edit/${data.path.replace('edit/', '')}`;
-    a.download = 'resolve_package.zip';
+    a.download = zipName;
     a.click();
   } finally {
-    exportBtn.textContent = 'Export for Resolve';
-    exportBtn.disabled = false;
+    btn.textContent = label;
+    btn.disabled = false;
   }
-});
+}
+
+exportBtn.addEventListener('click', () => runExport(false));
+exportVerticalBtn.addEventListener('click', () => runExport(true));
 
 // ── Render Vertical ────────────────────────────────────────────────────────
 renderVerticalBtn.addEventListener('click', async () => {

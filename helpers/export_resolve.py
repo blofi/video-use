@@ -75,6 +75,27 @@ def fr(s: float, fps: float) -> int:
 # -------- Shot extraction -----------------------------------------------------
 
 
+def get_video_dimensions(source: Path) -> tuple[int, int]:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height,coded_width,coded_height",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(source)],
+        capture_output=True, text=True, check=True,
+    )
+    vals = [int(v) for v in out.stdout.split() if v.strip().lstrip("-").isdigit() and int(v) > 0]
+    if len(vals) >= 2:
+        return vals[0], vals[1]
+    return 1920, 1080
+
+
+def vertical_crop_params(src_w: int, src_h: int, x_crop: float) -> tuple[int, int, int, int]:
+    """Return (crop_w, crop_h, x, y) for a 9:16 vertical window from a 16:9 source."""
+    crop_w = (src_h * 9 // 16) & ~1   # must be even
+    crop_h = src_h & ~1
+    x = int((src_w - crop_w) * max(0.0, min(1.0, x_crop))) & ~1
+    return crop_w, crop_h, x, 0
+
+
 def extract_shot_with_handles(
     source: Path,
     seg_start: float,
@@ -84,12 +105,12 @@ def extract_shot_with_handles(
     src_duration: float,
     shot_name: str,
     out_path: Path,
+    crop: tuple[int, int, int, int] | None = None,
 ) -> tuple[float, float]:
     """Extract a ProRes 422 HQ shot with handles and embedded source TC.
 
     Returns (actual_h_in, actual_h_out) in source seconds.
-    Explicit stream mapping ensures the correct audio stream is selected from
-    multi-stream sources (e.g. broadcast MXF with programme mix on 0:a:0).
+    If crop=(w,h,x,y) is provided, a crop filter is applied (for vertical exports).
     """
     handle_s = handle_frames / fps
     h_in  = max(0.0,         seg_start - handle_s)
@@ -97,12 +118,14 @@ def extract_shot_with_handles(
     tc    = "01:00:00:00"   # always fixed — we own these clips
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    vf = ["-vf", f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}"] if crop else []
     cmd = [
         "ffmpeg", "-y",
         "-ss", f"{h_in:.6f}",
         "-i", str(source),
         "-t", f"{h_out - h_in:.6f}",
         "-map", "0:v:0", "-map", "0:a:0",
+        *vf,
         "-c:v", "prores_ks", "-profile:v", "3",  # ProRes 422 HQ
         "-pix_fmt", "yuv422p10le",
         "-c:a", "pcm_s24le", "-ar", "48000",
@@ -205,10 +228,12 @@ def build_package(
     fps_override: float | None = None,
     make_zip: bool = False,
     out_zip: Path | None = None,
+    vertical: bool = False,
 ) -> Path:
     edl = json.loads(edl_path.read_text())
     edit_dir = edl_path.parent
-    shots_dir = edit_dir / "resolve_shots"
+    folder_name = "resolve_shots_vertical" if vertical else "resolve_shots"
+    shots_dir = edit_dir / folder_name
     shots_dir.mkdir(parents=True, exist_ok=True)
 
     sources = edl["sources"]
@@ -219,14 +244,16 @@ def build_package(
         src_path = resolve_path(src_rel, edit_dir)
         fps = fps_override or detect_fps(src_path)
         dur = detect_duration(src_path)
-        src_meta[src_key] = {"path": src_path, "fps": fps, "duration": dur}
+        w, h = get_video_dimensions(src_path) if vertical else (0, 0)
+        src_meta[src_key] = {"path": src_path, "fps": fps, "duration": dur, "w": w, "h": h}
 
     fps = src_meta[next(iter(sources))]["fps"]
 
     shots: list[dict] = []
     timeline_offset = 0.0
 
-    print(f"extracting {len(ranges)} shot(s) — ProRes 422 HQ, {handle_frames}-frame handles → resolve_shots/")
+    label = "vertical 9:16" if vertical else "16:9"
+    print(f"extracting {len(ranges)} shot(s) — ProRes 422 HQ {label}, {handle_frames}-frame handles → {folder_name}/")
     for i, r in enumerate(ranges):
         src_name = r["source"]
         meta = src_meta[src_name]
@@ -237,12 +264,17 @@ def build_package(
         beat = r.get("beat") or r.get("note") or ""
         shot_name = f"shot_{i + 1:02d}_{src_name}"
 
+        crop = None
+        if vertical:
+            x_crop = float(r.get("x_crop", 0.5))
+            crop = vertical_crop_params(meta["w"], meta["h"], x_crop)
+
         out_path = shots_dir / f"{shot_name}.mov"
         print(f"  [{i + 1:02d}] {src_name}  {seg_start:.2f}-{seg_end:.2f}  ({cut_dur:.2f}s)  {beat}")
 
         h_in, h_out = extract_shot_with_handles(
             src_path, seg_start, seg_end, handle_frames, meta["fps"], meta["duration"],
-            shot_name, out_path,
+            shot_name, out_path, crop=crop,
         )
         shots.append({
             "file": out_path,
@@ -266,12 +298,13 @@ def build_package(
 
     if make_zip:
         if out_zip is None:
-            out_zip = edit_dir / "resolve_package.zip"
+            zip_name = "resolve_package_vertical.zip" if vertical else "resolve_package.zip"
+            out_zip = edit_dir / zip_name
         with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
             for shot in shots:
-                zf.write(shot["file"], f"resolve_shots/{shot['file'].name}")
-            zf.write(otio_path, "resolve_shots/timeline.otio")
-            zf.write(readme_path, "resolve_shots/README.txt")
+                zf.write(shot["file"], f"{folder_name}/{shot['file'].name}")
+            zf.write(otio_path, f"{folder_name}/timeline.otio")
+            zf.write(readme_path, f"{folder_name}/README.txt")
         size_mb = out_zip.stat().st_size / (1024 * 1024)
         print(f"      zipped → {out_zip} ({size_mb:.1f} MB)")
         return out_zip
@@ -299,7 +332,11 @@ def main() -> None:
     )
     ap.add_argument(
         "-o", "--output", type=Path, default=None,
-        help="Output zip path when --zip is set (default: <edit_dir>/resolve_package.zip)",
+        help="Output zip path when --zip is set (default: <edit_dir>/resolve_package[_vertical].zip)",
+    )
+    ap.add_argument(
+        "--vertical", action="store_true",
+        help="Bake 9:16 crop (x_crop per range) into each clip for vertical delivery",
     )
     args = ap.parse_args()
 
@@ -314,6 +351,7 @@ def main() -> None:
         fps_override=args.fps,
         make_zip=args.zip,
         out_zip=out_zip,
+        vertical=args.vertical,
     )
 
 
