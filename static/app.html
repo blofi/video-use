@@ -296,6 +296,23 @@ body {
 }
 #player-placeholder strong { color: var(--text); display: block; margin-bottom: 6px; font-size: 16px; }
 
+/* ── 9:16 graticule overlay ──────────────────────────────────────── */
+#graticule {
+  position: absolute;
+  pointer-events: none;
+  display: none;
+  z-index: 10;
+  box-sizing: border-box;
+  border: 1.5px solid rgba(255, 255, 255, 0.55);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35), inset 0 0 0 1px rgba(0, 0, 0, 0.2);
+}
+#graticule.visible { display: block; }
+.btn-ghost.btn-active {
+  border-color: rgba(107, 159, 255, 0.6);
+  color: var(--blue);
+  background: rgba(107, 159, 255, 0.12);
+}
+
 /* ── Shot timeline ───────────────────────────────────────────────── */
 #timeline-section {
   flex-shrink: 0;
@@ -513,6 +530,7 @@ body {
   <span class="path" id="proj-path">—</span>
   <div class="actions">
     <button class="btn btn-green" id="transcribe-btn" style="display:none">Transcribe footage</button>
+    <button class="btn btn-ghost" id="graticule-btn" disabled>9:16 guide</button>
     <button class="btn btn-ghost" id="render-preview-btn" disabled>Preview</button>
     <button class="btn btn-blue" id="render-final-btn" disabled>Render Final</button>
     <button class="btn btn-green" id="render-vertical-btn" disabled>Render Vertical</button>
@@ -543,6 +561,7 @@ body {
   <div id="right-panel">
     <div id="player-section">
       <video id="player" controls></video>
+      <div id="graticule"></div>
       <div id="player-placeholder">
         <strong>No preview yet</strong>
         Ask the editor to transcribe your footage and create a cut.<br>
@@ -619,6 +638,10 @@ const cropFrameWrap= document.getElementById('crop-frame-wrap');
 const cropCancelBtn= document.getElementById('crop-cancel-btn');
 const subShotStrip = document.getElementById('sub-shot-strip');
 const cropSetBtn   = document.getElementById('crop-set-btn');
+const graticuleEl  = document.getElementById('graticule');
+const graticuleBtn = document.getElementById('graticule-btn');
+const playerSection= document.getElementById('player-section');
+let graticuleEnabled = false;
 let cropRangeIndex = -1;
 let cropXCrop = 0.5;
 let cropSubOffset = 0.0;    // source offset from range start of active sub-shot
@@ -830,6 +853,7 @@ function buildTimeline(edl, projectSources) {
   // Fetch shot boundaries asynchronously and inject tick marks
   shotThresholdWrap.classList.add('visible');
   loadShotsForAll(segments);
+  if (graticuleEnabled) updateGraticule(player.currentTime);
 }
 
 async function loadShotsForAll(segments, force) {
@@ -876,7 +900,71 @@ function updatePlayhead(currentTime) {
   });
 }
 
-player.addEventListener('timeupdate', () => updatePlayhead(player.currentTime));
+// ── 9:16 graticule ────────────────────────────────────────────────────────
+function getActiveXCrop(currentTime) {
+  const seg = currentSegments.find(
+    s => currentTime >= s.outputStart && currentTime < s.outputStart + s.duration
+  );
+  if (!seg) return null;
+  const subCrops = seg.sub_crops || [];
+  if (subCrops.length > 0) {
+    const srcOffset = currentTime - seg.outputStart;
+    const sorted = [...subCrops].sort((a, b) => a.offset - b.offset);
+    let xCrop = sorted[0].x_crop;
+    for (const sc of sorted) {
+      if (sc.offset <= srcOffset + 0.05) xCrop = sc.x_crop;
+    }
+    return xCrop;
+  }
+  return seg.x_crop != null ? seg.x_crop : 0.5;
+}
+
+function updateGraticule(currentTime) {
+  if (!graticuleEnabled || player.style.display === 'none' || !player.offsetWidth) {
+    graticuleEl.classList.remove('visible');
+    return;
+  }
+  const xCrop = getActiveXCrop(currentTime);
+  if (xCrop === null) { graticuleEl.classList.remove('visible'); return; }
+
+  const psRect = playerSection.getBoundingClientRect();
+  const pRect  = player.getBoundingClientRect();
+  const pW = pRect.width;
+  const pH = pRect.height;
+  if (!pW || !pH) { graticuleEl.classList.remove('visible'); return; }
+
+  const offsetLeft = pRect.left - psRect.left;
+  const offsetTop  = pRect.top  - psRect.top;
+
+  const cropW = Math.round(pH * 9 / 16);
+  const maxLeft = pW - cropW;
+  const cropLeft = Math.round(xCrop * maxLeft);
+
+  graticuleEl.style.left   = (offsetLeft + cropLeft) + 'px';
+  graticuleEl.style.top    = offsetTop + 'px';
+  graticuleEl.style.width  = cropW + 'px';
+  graticuleEl.style.height = pH + 'px';
+  graticuleEl.classList.add('visible');
+}
+
+graticuleBtn.addEventListener('click', () => {
+  graticuleEnabled = !graticuleEnabled;
+  graticuleBtn.classList.toggle('btn-active', graticuleEnabled);
+  if (!graticuleEnabled) {
+    graticuleEl.classList.remove('visible');
+  } else {
+    updateGraticule(player.currentTime);
+  }
+});
+
+new ResizeObserver(() => {
+  if (graticuleEnabled) updateGraticule(player.currentTime);
+}).observe(playerSection);
+
+player.addEventListener('timeupdate', () => {
+  updatePlayhead(player.currentTime);
+  if (graticuleEnabled) updateGraticule(player.currentTime);
+});
 
 // ── Video reload ───────────────────────────────────────────────────────────
 function loadVideo(path) {
@@ -904,9 +992,11 @@ async function loadProject() {
     const hasEdl = !!data.edl;
     renderPreviewBtn.disabled = !hasEdl;
     renderVerticalBtn.disabled = !hasEdl;
+    graticuleBtn.disabled = !hasEdl;
     exportBtn.disabled = !data.final_available;
     exportShotsBtn.disabled = !hasEdl;
     exportVerticalBtn.disabled = !hasEdl;
+    if (graticuleEnabled) updateGraticule(player.currentTime);
 
     // Show transcribe button only when clips exist but no transcript yet
     const needsTranscribe = data.sources.length > 0 && !data.takes_packed;
