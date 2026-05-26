@@ -806,16 +806,27 @@ function buildTimeline(edl, projectSources) {
 }
 
 async function loadShotsForAll(segments) {
+  // Track which sources we've already force-busted this session to avoid repeating
+  const forceBusted = new Set();
   for (let i = 0; i < segments.length; i++) {
     const seg = segments[i];
     if (!seg._sourcePath) continue;
     try {
-      const res = await fetch(
-        `/api/shots?source=${encodeURIComponent(seg._sourcePath)}&start=${seg.start}&end=${seg.end}`
-      );
+      const url = `/api/shots?source=${encodeURIComponent(seg._sourcePath)}&start=${seg.start}&end=${seg.end}`;
+      let res = await fetch(url);
       if (!res.ok) continue;
-      const data = await res.json();
-      const cuts = data.cuts || [];
+      let data = await res.json();
+      let cuts = data.cuts || [];
+      // If only the t=0 sentinel came back and we haven't force-busted this source yet,
+      // the cache may be stale from before the regex fix — re-run with force=true once.
+      if (cuts.length <= 1 && !forceBusted.has(seg._sourcePath)) {
+        forceBusted.add(seg._sourcePath);
+        const forceRes = await fetch(url + '&force=true');
+        if (forceRes.ok) {
+          const forceData = await forceRes.json();
+          cuts = forceData.cuts || cuts;
+        }
+      }
       segmentShots[i] = cuts;
       injectTicks(i, seg, cuts);
     } catch (_) { /* non-critical, skip silently */ }
