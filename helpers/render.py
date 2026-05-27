@@ -681,7 +681,17 @@ def build_final_composite(
     has_vo = bool(vo_track)
     if has_vo:
         vo_path = resolve_path(vo_track["file"], edit_dir)
-        has_vo = vo_path.exists()
+        if not vo_path.exists():
+            # Relative paths in vo_track.file are sometimes written relative to the
+            # project root (parent of edit_dir), e.g. "edit/vo_clean.wav". Try that.
+            vo_path = resolve_path(vo_track["file"], edit_dir.parent)
+        if not vo_path.exists():
+            print(
+                f"warning: vo_track file not found: {vo_track['file']!r}\n"
+                f"  tried: {vo_path}\n"
+                f"  VO will be absent from output — fix the path and re-render."
+            )
+            has_vo = False
 
     if not has_overlays and not has_subs and not has_vo:
         # Nothing to do — just rename/copy base to final name
@@ -734,20 +744,26 @@ def build_final_composite(
         else:
             out_label = "[0:v]"
 
-    # VO audio mix — amix base audio with VO WAV, muting VO during sync (grab/PTC) ranges
+    # VO audio mix — switch between camera and VO audio based on audio_mode per segment.
+    # sync_intervals = output-timeline windows where audio_mode is "sync" (camera plays,
+    # VO is silenced). Everywhere else is a VO window (VO plays, camera is silenced).
+    # normalize=0 keeps each stream at its specified volume rather than halving both.
     if has_vo:
         vol = float(vo_track.get("vol", 1.0))
         if sync_intervals:
-            # Silence VO whenever the playhead is inside a sync range
-            cond = "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in sync_intervals)
-            vol_expr = f"if({cond},0,{vol:.3f})"
-            vo_vol_filter = f"[{vo_input_idx}:a]volume=volume='{vol_expr}'[vo_a]"
+            sync_cond = "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in sync_intervals)
+            # Camera at full volume during sync; silenced during VO segments
+            cam_filter = f"[0:a]volume=volume='if({sync_cond},1.0,0.0)'[base_a]"
+            # VO plays during non-sync segments; silenced during sync
+            vo_filter = f"[{vo_input_idx}:a]volume=volume='if({sync_cond},0.0,{vol:.3f})'[vo_a]"
         else:
-            vo_vol_filter = f"[{vo_input_idx}:a]volume={vol:.3f}[vo_a]"
+            # No sync segments at all — silence camera, pass VO at requested volume
+            cam_filter = f"[0:a]volume=0.0[base_a]"
+            vo_filter = f"[{vo_input_idx}:a]volume={vol:.3f}[vo_a]"
         filter_parts.append(
-            f"[0:a]volume=1.0[base_a];"
-            f"{vo_vol_filter};"
-            f"[base_a][vo_a]amix=inputs=2:duration=longest:dropout_transition=0[aout]"
+            f"{cam_filter};"
+            f"{vo_filter};"
+            f"[base_a][vo_a]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[aout]"
         )
         audio_map = ["-map", "[aout]"]
         audio_codec = ["-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
