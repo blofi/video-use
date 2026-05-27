@@ -551,6 +551,86 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
     print(f"master SRT → {out_path.name} ({len(entries)} cues)")
 
 
+# -------- VO WAV timeline expansion -----------------------------------------
+
+
+def _expand_vo_wav(
+    compact_wav: Path,
+    sync_intervals: list[tuple[float, float]],
+    total_duration: float,
+    out_wav: Path,
+    sample_rate: int = 48000,
+) -> None:
+    """Rewrite compact VO WAV to full output-timeline duration.
+
+    cut_vo.py writes a compact WAV (just the spliced VO audio, no silence).
+    Played via amix, the WAV advances continuously — during sync windows it
+    is muted by the volume envelope but still consumes samples, so the read
+    position drifts out of sync with the VO windows that follow.
+
+    This function rebuilds the WAV so it is the same length as the output video:
+      - VO intervals  → audio read sequentially from compact_wav
+      - sync intervals → digital silence (aevalsrc=0)
+
+    After expansion a plain constant-volume amix aligns correctly.
+    """
+    # Build ordered list of (start, end, is_sync) covering 0..total_duration
+    intervals: list[tuple[float, float, bool]] = []
+    prev = 0.0
+    for s, e in sorted(sync_intervals):
+        if prev < s - 0.001:
+            intervals.append((prev, s, False))
+        intervals.append((s, e, True))
+        prev = e
+    if prev < total_duration - 0.001:
+        intervals.append((prev, total_duration, False))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        parts: list[Path] = []
+        vo_offset = 0.0  # read cursor in compact_wav
+
+        for i, (start, end, is_sync) in enumerate(intervals):
+            dur = end - start
+            if dur < 0.001:
+                continue
+            part = tmp_dir / f"part_{i:03d}.wav"
+            if is_sync:
+                subprocess.run([
+                    "ffmpeg", "-y", "-f", "lavfi",
+                    "-i", f"aevalsrc=0:channel_layout=mono:sample_rate={sample_rate}:duration={dur:.4f}",
+                    "-c:a", "pcm_s16le", str(part),
+                ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            else:
+                subprocess.run([
+                    "ffmpeg", "-y",
+                    "-ss", f"{vo_offset:.4f}",
+                    "-i", str(compact_wav),
+                    "-t", f"{dur:.4f}",
+                    "-vn", "-ac", "1", "-ar", str(sample_rate), "-c:a", "pcm_s16le",
+                    str(part),
+                ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                vo_offset += dur
+            parts.append(part)
+
+        if not parts:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", str(compact_wav), "-c", "copy", str(out_wav)],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            )
+            return
+
+        concat_list = tmp_dir / "concat.txt"
+        concat_list.write_text("".join(f"file '{p.resolve()}'\n" for p in parts))
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_list),
+            "-vn", "-ac", "1", "-ar", str(sample_rate), "-c:a", "pcm_s16le",
+            str(out_wav),
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+
 # -------- Loudness normalization (social-ready audio) -----------------------
 
 
@@ -761,10 +841,12 @@ def build_final_composite(
         vol = float(vo_track.get("vol", 1.0))
         if sync_intervals:
             sync_cond = "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in sync_intervals)
-            # eval=frame is required so that 't' is re-evaluated on every audio frame
-            # rather than once at filter init (the default eval=once freezes 't' at 0).
+            # Camera plays during sync intervals, silenced during VO intervals.
+            # eval=frame re-evaluates 't' per audio frame (default eval=once freezes at t=0).
             cam_filter = f"[0:a]volume=volume='if({sync_cond},1.0,0.0)':eval=frame[base_a]"
-            vo_filter = f"[{vo_input_idx}:a]volume=volume='if({sync_cond},0.0,{vol:.3f})':eval=frame[vo_a]"
+            # VO WAV is already expanded (silence at sync positions by _expand_vo_wav),
+            # so a constant volume is correct — no time-varying expression needed.
+            vo_filter = f"[{vo_input_idx}:a]volume={vol:.3f}[vo_a]"
         else:
             # No sync segments at all — silence camera, pass VO at requested volume
             cam_filter = f"[0:a]volume=0.0[base_a]"
@@ -894,6 +976,7 @@ def main() -> None:
 
     # Compute output-timeline intervals where camera audio should play (VO muted).
     sync_intervals: list[tuple[float, float]] = []
+    total_dur = 0.0
     if vo_track:
         t = 0.0
         for r in edl.get("ranges", []):
@@ -904,6 +987,24 @@ def main() -> None:
             ):
                 sync_intervals.append((t, t + dur))
             t += dur
+        total_dur = t
+
+    # Expand compact VO WAV to full output-timeline duration.
+    # cut_vo writes a compact WAV (VO audio only, no silence). Playing it via amix,
+    # the WAV read position advances through sync windows even though the volume is
+    # zero there, consuming content that should play in the next VO window. Expanding
+    # it — inserting silence at sync positions — fixes the alignment before mixing.
+    if vo_track and sync_intervals:
+        _vo_path = resolve_path(vo_track["file"], edit_dir)
+        if not _vo_path.exists():
+            _vo_path = resolve_path(vo_track["file"], edit_dir.parent)
+        if _vo_path.exists() and _vo_path.stat().st_size > 200:
+            expanded_wav = edit_dir / "vo_expanded.wav"
+            print(f"  expanding VO WAV → {total_dur:.1f}s timeline "
+                  f"({len(sync_intervals)} sync interval(s))")
+            _expand_vo_wav(_vo_path, sync_intervals, total_dur, expanded_wav)
+            vo_track = dict(vo_track)
+            vo_track["file"] = str(expanded_wav)
 
     if args.no_loudnorm:
         # Composite directly to final output

@@ -122,10 +122,12 @@ def _run(cmd: list[str]) -> None:
 
 
 def splice_segments(source: Path, segments: list[dict], out_wav: Path) -> None:
-    """Extract segments from source and join them with 30ms acrossfades.
+    """Extract segments from source, apply 30ms fades, and concat.
 
-    For N=1: simple extract.
-    For N>1: extract each to a temp WAV, then chain with acrossfade filter.
+    Each segment gets an afade in/out baked in during extraction. Segments are
+    then joined with the concat demuxer rather than a filter_complex acrossfade
+    chain — the latter silently produces empty output for large N (60+ segments)
+    because ffmpeg's internal graph memory limits are hit without a non-zero exit.
     Output: 48kHz mono PCM WAV.
     """
     with tempfile.TemporaryDirectory() as tmp:
@@ -135,12 +137,18 @@ def splice_segments(source: Path, segments: list[dict], out_wav: Path) -> None:
         for i, seg in enumerate(segments):
             out = tmp_dir / f"seg_{i:03d}.wav"
             dur = seg["end"] - seg["start"]
+            fade_out_start = max(0.0, dur - CROSSFADE_S)
             _run([
                 "ffmpeg", "-y",
                 "-ss", f"{seg['start']:.3f}",
                 "-i", str(source),
                 "-t", f"{dur:.3f}",
-                "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-c:a", "pcm_s16le",
+                "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE),
+                "-af", (
+                    f"afade=t=in:st=0:d={CROSSFADE_S:.3f},"
+                    f"afade=t=out:st={fade_out_start:.3f}:d={CROSSFADE_S:.3f}"
+                ),
+                "-c:a", "pcm_s16le",
                 str(out),
             ])
             seg_paths.append(out)
@@ -148,31 +156,17 @@ def splice_segments(source: Path, segments: list[dict], out_wav: Path) -> None:
         if len(seg_paths) == 1:
             _run([
                 "ffmpeg", "-y", "-i", str(seg_paths[0]),
-                "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-c:a", "pcm_s16le",
-                str(out_wav),
+                "-c:a", "pcm_s16le", str(out_wav),
             ])
             return
 
-        # Chain pairwise acrossfades
-        inputs: list[str] = []
-        for p in seg_paths:
-            inputs += ["-i", str(p)]
-
-        n = len(seg_paths)
-        filter_parts: list[str] = []
-        prev = "[0]"
-        for i in range(1, n):
-            nxt = f"[cf{i}]" if i < n - 1 else "[out]"
-            filter_parts.append(
-                f"{prev}[{i}]acrossfade=d={CROSSFADE_S:.3f}:c1=tri:c2=tri{nxt}"
-            )
-            prev = nxt
-
+        # Concat demuxer: scales to any number of segments reliably
+        concat_list = tmp_dir / "concat.txt"
+        concat_list.write_text("".join(f"file '{p.resolve()}'\n" for p in seg_paths))
         _run([
             "ffmpeg", "-y",
-            *inputs,
-            "-filter_complex", ";".join(filter_parts),
-            "-map", "[out]",
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_list),
             "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-c:a", "pcm_s16le",
             str(out_wav),
         ])
@@ -344,6 +338,16 @@ def cut_vo(
         spliced_wav = Path(tmp) / "spliced.wav"
         print("splicing audio segments…")
         splice_segments(source_path, segments, spliced_wav)
+        if not spliced_wav.exists() or spliced_wav.stat().st_size < 500:
+            return {
+                "status": "error",
+                "message": (
+                    f"splice_segments produced an empty or near-empty file "
+                    f"({spliced_wav.stat().st_size if spliced_wav.exists() else 0} bytes). "
+                    "ffmpeg likely failed silently on the audio extraction. "
+                    "Check that the source WAV is readable and the transcript timestamps are valid."
+                ),
+            }
         # Silence at grab/PTC positions is handled in render.py via volume envelope.
         shutil.copy2(spliced_wav, out_wav)
 
