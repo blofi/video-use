@@ -149,6 +149,24 @@ async def serve_edit_file(file_path: str, request: Request):
     return StreamingResponse(_stream(), media_type=ct)
 
 
+# ── API: set videos directory ─────────────────────────────────────────────────
+
+@app.post("/api/set-videos-dir")
+async def set_videos_dir(request: Request):
+    global VIDEOS_DIR, EDIT_DIR
+    body = await request.json()
+    path_str = body.get("path", "").strip()
+    if not path_str:
+        raise HTTPException(status_code=400, detail="path is required")
+    p = Path(path_str).resolve()
+    if not p.exists() or not p.is_dir():
+        raise HTTPException(status_code=400, detail=f"Directory not found: {p}")
+    VIDEOS_DIR = p
+    EDIT_DIR = p / "edit"
+    EDIT_DIR.mkdir(parents=True, exist_ok=True)
+    return JSONResponse({"videos_dir": str(VIDEOS_DIR), "edit_dir": str(EDIT_DIR)})
+
+
 # ── API: project state ─────────────────────────────────────────────────────────
 
 @app.get("/api/project")

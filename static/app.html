@@ -59,6 +59,30 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
   flex: 1;
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 2px 6px;
+  transition: background 0.12s, color 0.12s;
+}
+#header .path:hover { background: var(--surface2); color: var(--text); }
+#path-input {
+  display: none;
+  font-family: var(--mono);
+  font-size: 11px;
+  flex: 1;
+  background: var(--surface2);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 3px 8px;
+  outline: none;
+}
+#path-error {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--red);
+  flex-shrink: 0;
+  display: none;
 }
 #header .actions {
   display: flex;
@@ -378,7 +402,9 @@ body {
 <!-- Header -->
 <div id="header">
   <span class="logo">video-use</span>
-  <span class="path" id="proj-path">—</span>
+  <span class="path" id="proj-path" title="Click to change folder">—</span>
+  <input id="path-input" type="text" spellcheck="false" placeholder="Paste folder path and press Enter">
+  <span id="path-error"></span>
   <div class="actions">
     <button class="btn btn-green" id="transcribe-btn" style="display:none">Transcribe footage</button>
     <button class="btn btn-ghost" id="render-preview-btn" disabled>Preview</button>
@@ -811,6 +837,73 @@ exportBtn.addEventListener('click', async () => {
 
 // ── Image modal ────────────────────────────────────────────────────────────
 imgModal.addEventListener('click', () => imgModal.classList.remove('open'));
+
+// ── Folder picker ───────────────────────────────────────────────────────────
+const pathInput = document.getElementById('path-input');
+const pathError = document.getElementById('path-error');
+
+function showPathInput() {
+  projPathEl.style.display = 'none';
+  pathError.style.display = 'none';
+  pathInput.value = projPathEl.textContent === '—' ? '' : projPathEl.textContent;
+  pathInput.style.display = 'block';
+  pathInput.focus();
+  pathInput.select();
+}
+
+function hidePathInput() {
+  pathInput.style.display = 'none';
+  pathError.style.display = 'none';
+  projPathEl.style.display = '';
+}
+
+async function switchVideosDir(newPath) {
+  pathError.style.display = 'none';
+  try {
+    const res = await fetch('/api/set-videos-dir', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({path: newPath}),
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      pathError.textContent = err.detail || 'Invalid path';
+      pathError.style.display = '';
+      pathInput.focus();
+      return;
+    }
+    hidePathInput();
+    // Reset UI for the new directory
+    player.src = '';
+    player.style.display = 'none';
+    playerPlaceholder.style.display = '';
+    timelineTrack.innerHTML = '<span id="timeline-empty">No cut yet — the timeline will appear after the first render.</span>';
+    currentSegments = [];
+    _projectLoadedOnce = false;
+    addMessage('assistant', `Switched to: ${newPath}`);
+    loadProject();
+  } catch (e) {
+    pathError.textContent = 'Could not reach server';
+    pathError.style.display = '';
+  }
+}
+
+projPathEl.addEventListener('click', showPathInput);
+
+pathInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    const v = pathInput.value.trim();
+    if (v) switchVideosDir(v);
+  } else if (e.key === 'Escape') {
+    hidePathInput();
+  }
+});
+
+pathInput.addEventListener('blur', () => {
+  setTimeout(() => {
+    if (!pathError.textContent) hidePathInput();
+  }, 150);
+});
 
 // ── Init ───────────────────────────────────────────────────────────────────
 connect();
