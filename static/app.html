@@ -892,11 +892,17 @@ projPathEl.addEventListener('click', showPathInput);
 
 pathInput.addEventListener('keydown', e => {
   if (e.key === 'Enter') {
-    const v = pathInput.value.trim();
+    const v = pathInput.value.trim().replace(/^["']+|["']+$/g, '');
     if (v) switchVideosDir(v);
   } else if (e.key === 'Escape') {
     hidePathInput();
   }
+});
+
+pathInput.addEventListener('paste', e => {
+  e.preventDefault();
+  const pasted = (e.clipboardData || window.clipboardData).getData('text');
+  pathInput.value = pasted.trim().replace(/^["']+|["']+$/g, '');
 });
 
 pathInput.addEventListener('blur', () => {
