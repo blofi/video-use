@@ -25,7 +25,7 @@ cp .env.example .env
 # then add ELEVENLABS_API_KEY=... to .env
 ```
 
-Optional: `yt-dlp` (URL sources), Node.js 22+ (HyperFrames/Remotion animations). Animation engines (Manim, HyperFrames, Remotion) are installed per-project on first use, not globally.
+Optional: `yt-dlp` (URL sources).
 
 ## No Formal Test Suite or Linter
 
@@ -41,8 +41,7 @@ All helpers live in `helpers/` and are invoked as `python helpers/<name>.py`:
 | `transcribe_batch.py` | 4-worker parallel transcription for multi-take projects |
 | `pack_transcripts.py` | Consolidates `transcripts/*.json` → `takes_packed.md` (phrase-level, ~12KB) |
 | `timeline_view.py` | Generates filmstrip + waveform + word-label PNG for a time range |
-| `render.py` | Final renderer: extract → concat → overlay → subtitles. Flags: `--preview`, `--build-subtitles`, `--no-subtitles`, `--vertical` |
-| `grade.py` | Applies ffmpeg filter chains; presets: `warm_cinematic`, `neutral_punch`, `none`, or `--filter '<raw>'` |
+| `render.py` | Final renderer: extract → concat → subtitles. Flags: `--preview`, `--build-subtitles`, `--no-subtitles`, `--vertical` |
 | `extract_clips.py` | ProRes 422 clips + OTIO timeline for broadcast NLE delivery. Flags: `--handles SECONDS`, `--deinterlace`, `-o output.otio` |
 | `export_resolve.py` | ProRes 422 HQ + OpenTimelineIO `.otio` for any OTIO-compatible NLE; flags: `--handles N`, `--zip` |
 
@@ -58,8 +57,8 @@ Transcribe → Pack → LLM reasons over takes_packed.md → edl.json → Render
 2. Pre-scan transcript for verbal slips
 3. Converse with user; propose strategy in plain English; wait for confirmation
 4. Sub-agent produces `edl.json`; use `timeline_view` at ambiguous cut points
-5. Render at 720p (`--preview`) for fast iteration
-6. Self-eval: `timeline_view` at every cut boundary; check for jumps, audio pops, subtitle obscuration
+5. Render (`--preview`) for fast iteration
+6. Self-eval: `timeline_view` at every cut boundary; check for jumps, audio pops, subtitle readability
 7. Persist session notes to `edit/project.md`
 
 ## Output Layout
@@ -70,10 +69,9 @@ All outputs go under `<videos_dir>/edit/`:
 edit/
 ├── project.md          # session memory
 ├── takes_packed.md     # LLM reading view of transcripts
-├── edl.json            # cut decisions + grade + overlays + subtitles
+├── edl.json            # cut decisions + subtitles
 ├── transcripts/        # cached raw Scribe JSON (one file per source)
-├── animations/slot_<id>/
-├── clips_graded/
+├── clips/              # per-segment extracts with fades
 ├── master.srt          # subtitles in output-timeline space
 ├── downloads/          # yt-dlp outputs
 ├── verify/             # debug frames / timeline PNGs
@@ -81,27 +79,40 @@ edit/
 └── final.mp4
 ```
 
-## 12 Hard Rules (non-negotiable for production correctness)
+## 10 Hard Rules (non-negotiable for production correctness)
 
-1. Subtitles applied **last** (after all overlays)
+1. Subtitles applied **last**
 2. Per-segment extract → lossless `-c copy` concat; not a single-pass filtergraph
 3. 30ms audio fades at every segment boundary
-4. Overlays use `setpts=PTS-STARTPTS+T/TB`
-5. Master SRT uses output-timeline offsets
-6. **Never cut inside a word**
-7. Pad cut edges (30–200ms working window)
-8. Word-level verbatim ASR only (not phrase-mode SRT)
-9. Cache transcripts per source
-10. Parallel sub-agents for multiple animations
-11. Strategy confirmation before execution
-12. All session outputs in `<videos_dir>/edit/`
-13. OTIO is the sole interchange format — no EDL, no FCPXML
+4. Master SRT uses output-timeline offsets
+5. **Never cut inside a word**
+6. Pad cut edges (30–200ms working window)
+7. Word-level verbatim ASR only (not phrase-mode SRT)
+8. Cache transcripts per source
+9. Strategy confirmation before execution
+10. All session outputs in `<videos_dir>/edit/`
+11. OTIO is the sole interchange format — no EDL, no FCPXML
+
+## Web Interface (server.py)
+
+A FastAPI server wraps the editing pipeline for browser-based use:
+
+```bash
+python server.py --videos-dir /path/to/footage [--port 8765]
+```
+
+- Serves `static/app.html` at `/` — a single-page chat UI
+- Streams video with HTTP Range support (`/video?path=...`) for browser seek
+- Exposes `GET /api/project` for current state (edl, transcript, sources, render availability)
+- `POST /api/render` (SSE) and `POST /api/export` invoke `render.py` / `export_resolve.py` as subprocesses
+- `/ws/chat` WebSocket drives Claude via the Anthropic API with tool use; tools available to the LLM: `write_edl`, `render_preview`, `render_final`, `run_transcribe`, `timeline_view`, `read_transcript`
+- `total_duration_s` is always recomputed server-side when `write_edl` is called — never trust the LLM's arithmetic
+- `SKILL.md` is loaded at startup and injected into every chat system prompt; `takes_packed.md` is read via the `read_transcript` tool (not via the system prompt) to avoid token bloat
 
 ## Key Reference Files
 
-- **`SKILL.md`** — complete editing workflow, hard rules, helpers API, animation techniques, subtitle styles, grade examples. Primary reference for all editing operations.
+- **`SKILL.md`** — complete editing workflow, hard rules, helpers API, subtitle styles. Primary reference for all editing operations.
 - **`install.md`** — first-time setup guide for end users.
-- **`skills/manim-video/`** — vendored Manim animation sub-skill with its own SKILL.md and references for equations, animations, and visual design.
 
 ## Design Principles
 
@@ -109,4 +120,3 @@ edit/
 - **Audio-primary**: cuts come from speech boundaries and silence gaps.
 - **Confirm before execute**: propose strategy in plain English, wait for user OK.
 - **Self-evaluate**: run `timeline_view` on rendered output before reporting done.
-- **Lazy installation**: install Node/Remotion/Manim only when the user's project needs them.

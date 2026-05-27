@@ -1,12 +1,10 @@
 """Render a video from an EDL.
 
-Implements the HEURISTICS render pipeline in the correct order:
+Implements the render pipeline in the correct order:
 
-  1. Per-segment extract with color grade + 30ms audio fades baked in
+  1. Per-segment extract with 30ms audio fades baked in
   2. Lossless -c copy concat into base.mp4
-  3. If overlays or subtitles: single filter graph that overlays animations
-     (with PTS shift so frame 0 lands at the overlay window start)
-     and applies `subtitles` filter LAST → final.mp4
+  3. If subtitles: apply `subtitles` filter LAST → final.mp4
 
 Optionally builds a master SRT from the per-source transcripts + EDL
 output-timeline offsets, applies the proven force_style (2-word
@@ -27,16 +25,6 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-
-try:
-    from grade import get_preset, auto_grade_for_clip  # same directory
-except Exception:
-    def get_preset(name: str) -> str:
-        return ""
-
-    def auto_grade_for_clip(video, start=0.0, duration=None, verbose=False):  # type: ignore
-        return "eq=contrast=1.03:saturation=0.98", {}
-
 
 # -------- Subtitle style (bold-overlay, proven at 1920×1080 and 1080×1920) --
 #
@@ -62,26 +50,6 @@ def run(cmd: list[str], quiet: bool = False) -> None:
     if not quiet:
         print(f"  $ {' '.join(str(c) for c in cmd[:6])}{' …' if len(cmd) > 6 else ''}")
     subprocess.run(cmd, check=True)
-
-
-def resolve_grade_filter(grade_field: str | None) -> str:
-    """The EDL's 'grade' field can be a preset name, a raw ffmpeg filter, or 'auto'.
-
-    Returns the filter string to embed into the per-segment -vf chain.
-    For 'auto', returns the sentinel "__AUTO__" which is resolved per-segment.
-    """
-    if not grade_field:
-        return ""
-    if grade_field == "auto":
-        return "__AUTO__"
-    # Preset names are short identifiers, filter strings contain '=' or ','.
-    if re.fullmatch(r"[a-zA-Z0-9_\-]+", grade_field):
-        try:
-            return get_preset(grade_field)
-        except KeyError:
-            print(f"warning: unknown preset '{grade_field}', using as raw filter")
-            return grade_field
-    return grade_field
 
 
 def resolve_path(maybe_path: str, base: Path) -> Path:
@@ -228,14 +196,13 @@ def extract_segment(
     source: Path,
     seg_start: float,
     duration: float,
-    grade_filter: str,
     out_path: Path,
     preview: bool = False,
     draft: bool = False,
     vertical: bool = False,
     audio_streams: int = 1,
 ) -> None:
-    """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
+    """Extract a cut range as its own MP4 with 30ms audio fades baked in.
 
     `-ss` before `-i` for fast accurate seeking. Scale to 1080p from 4K.
     Portrait sources (height > width) are scaled by height to preserve orientation.
@@ -281,8 +248,6 @@ def extract_segment(
     vf_parts.append(scale)
     if crop:
         vf_parts.append(crop)
-    if grade_filter:
-        vf_parts.append(grade_filter)
     vf = ",".join(vf_parts)
 
     # 30ms audio fades at both edges (Rule 3) — prevent pops
@@ -333,18 +298,12 @@ def extract_all_segments(
     vertical: bool = False,
     audio_streams: int = 1,
 ) -> list[Path]:
-    """Extract every EDL range into edit_dir/clips_graded/seg_NN.mp4.
+    """Extract every EDL range into edit_dir/clips/seg_NN.mp4.
     Returns the ordered list of segment paths.
-
-    If the EDL `grade` is "auto", analyze each segment range with
-    `auto_grade_for_clip` and apply a per-segment subtle correction.
-    Otherwise, apply the same preset/raw filter to every segment.
     """
-    resolved = resolve_grade_filter(edl.get("grade"))
-    is_auto = resolved == "__AUTO__"
     suffix = "_vertical" if vertical else ""
     clips_dir = edit_dir / (
-        f"clips_draft{suffix}" if draft else (f"clips_preview{suffix}" if preview else f"clips_graded{suffix}")
+        f"clips_draft{suffix}" if draft else (f"clips_preview{suffix}" if preview else f"clips{suffix}")
     )
     clips_dir.mkdir(parents=True, exist_ok=True)
 
@@ -353,8 +312,6 @@ def extract_all_segments(
 
     seg_paths: list[Path] = []
     print(f"extracting {len(ranges)} segment(s) → {clips_dir.name}/")
-    if is_auto:
-        print("  (auto-grade per segment: analyzing each range)")
     for i, r in enumerate(ranges):
         src_name = r["source"]
         src_path = resolve_path(sources[src_name], edit_dir)
@@ -363,16 +320,9 @@ def extract_all_segments(
         duration = end - start
         out_path = clips_dir / f"seg_{i:02d}_{src_name}.mp4"
 
-        if is_auto:
-            seg_filter, _stats = auto_grade_for_clip(src_path, start=start, duration=duration, verbose=False)
-        else:
-            seg_filter = resolved
-
         note = r.get("beat") or r.get("note") or ""
         print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
-        if is_auto:
-            print(f"        grade: {seg_filter or '(none)'}")
-        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft, vertical=vertical, audio_streams=audio_streams)
+        extract_segment(src_path, start, duration, out_path, preview=preview, draft=draft, vertical=vertical, audio_streams=audio_streams)
         seg_paths.append(out_path)
 
     return seg_paths
@@ -607,73 +557,32 @@ def apply_loudnorm_two_pass(
     return True
 
 
-# -------- Final compositing (Rule 1 + Rule 4) -------------------------------
+# -------- Final compositing (Rule 1) ----------------------------------------
 
 
 def build_final_composite(
     base_path: Path,
-    overlays: list[dict],
     subtitles_path: Path | None,
     out_path: Path,
-    edit_dir: Path,
 ) -> None:
-    """Final pass: base → overlays (PTS-shifted) → subtitles LAST → out.
+    """Final pass: base → subtitles LAST → out.
 
-    If there are no overlays and no subtitles, just copy base to out.
+    If there are no subtitles, just copy base to out.
     """
-    has_overlays = bool(overlays)
     has_subs = subtitles_path is not None and subtitles_path.exists()
 
-    if not has_overlays and not has_subs:
-        # Nothing to do — just rename/copy base to final name
+    if not has_subs:
         run(["ffmpeg", "-y", "-i", str(base_path), "-c", "copy", str(out_path)], quiet=True)
         return
 
-    inputs: list[str] = ["-i", str(base_path)]
-    for ov in overlays:
-        ov_path = resolve_path(ov["file"], edit_dir)
-        inputs += ["-i", str(ov_path)]
-
-    filter_parts: list[str] = []
-    # PTS-shift every overlay so its frame 0 lands at start_in_output
-    for idx, ov in enumerate(overlays, start=1):
-        t = float(ov["start_in_output"])
-        filter_parts.append(f"[{idx}:v]setpts=PTS-STARTPTS+{t}/TB[a{idx}]")
-
-    # Chain overlays on top of base
-    current = "[0:v]"
-    for idx, ov in enumerate(overlays, start=1):
-        t = float(ov["start_in_output"])
-        dur = float(ov["duration"])
-        end = t + dur
-        next_label = f"[v{idx}]"
-        filter_parts.append(
-            f"{current}[a{idx}]overlay=enable='between(t,{t:.3f},{end:.3f})'{next_label}"
-        )
-        current = next_label
-
-    # Subtitles LAST — Rule 1
-    if has_subs:
-        subs_abs = str(subtitles_path.resolve()).replace(":", r"\:").replace("'", r"\'")
-        filter_parts.append(
-            f"{current}subtitles='{subs_abs}':force_style='{SUB_FORCE_STYLE}'[outv]"
-        )
-        out_label = "[outv]"
-    else:
-        # Rename the last overlay output to [outv] for consistency
-        if has_overlays:
-            filter_parts.append(f"{current}null[outv]")
-            out_label = "[outv]"
-        else:
-            out_label = "[0:v]"
-
-    filter_complex = ";".join(filter_parts)
+    subs_abs = str(subtitles_path.resolve()).replace(":", r"\:").replace("'", r"\'")
+    filter_str = f"subtitles='{subs_abs}':force_style='{SUB_FORCE_STYLE}'"
 
     cmd = [
         "ffmpeg", "-y",
-        *inputs,
-        "-filter_complex", filter_complex,
-        "-map", out_label,
+        "-i", str(base_path),
+        "-vf", filter_str,
+        "-map", "0:v",
         "-map", "0:a",
         "-c:v", "libx264", "-preset", "fast", "-crf", "18",
         "-pix_fmt", "yuv420p",
@@ -681,8 +590,7 @@ def build_final_composite(
         "-movflags", "+faststart",
         str(out_path),
     ]
-    print(f"compositing → {out_path.name}")
-    print(f"  overlays: {len(overlays)}, subtitles: {'yes' if has_subs else 'no'}")
+    print(f"subtitles → {out_path.name}")
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
@@ -724,7 +632,7 @@ def main() -> None:
         help=(
             "Output 9:16 vertical video (1080×1920) for Reels / TikTok / Shorts. "
             "Landscape sources are scaled to height 1920 then centre-cropped to 1080 wide. "
-            "Portrait sources are left as-is. Clips land in clips_graded_vertical/ "
+            "Portrait sources are left as-is. Clips land in clips_vertical/ "
             "so horizontal and vertical renders can coexist in the same edit dir."
         ),
     )
@@ -743,7 +651,7 @@ def main() -> None:
     edit_dir = edl_path.parent
     out_path = args.output.resolve()
 
-    # 1. Extract per-segment (auto-grade per range if EDL grade is "auto")
+    # 1. Extract per-segment
     segment_paths = extract_all_segments(
         edl, edit_dir, preview=args.preview, draft=args.draft, vertical=args.vertical,
         audio_streams=args.audio_streams,
@@ -772,15 +680,14 @@ def main() -> None:
                 print(f"warning: subtitles path in EDL does not exist: {subs_path}")
                 subs_path = None
 
-    # 4. Composite (overlays + subtitles LAST) → intermediate (pre-loudnorm) path
-    overlays = edl.get("overlays") or []
+    # 4. Subtitles LAST → intermediate (pre-loudnorm) path
     if args.no_loudnorm:
         # Composite directly to final output
-        build_final_composite(base_path, overlays, subs_path, out_path, edit_dir)
+        build_final_composite(base_path, subs_path, out_path)
     else:
         # Composite to a temp file, then run loudnorm → final output
         tmp_composite = out_path.with_suffix(".prenorm.mp4")
-        build_final_composite(base_path, overlays, subs_path, tmp_composite, edit_dir)
+        build_final_composite(base_path, subs_path, tmp_composite)
         print("loudness normalization → social-ready (-14 LUFS / -1 dBTP / LRA 11)")
         apply_loudnorm_two_pass(tmp_composite, out_path, preview=args.draft)
         tmp_composite.unlink(missing_ok=True)

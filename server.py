@@ -237,7 +237,7 @@ TOOLS = [
         "name": "write_edl",
         "description": (
             "Write the EDL (Edit Decision List) to disk at edit/edl.json. "
-            "Call this once you have decided on all cuts, grade, overlays, and subtitles. "
+            "Call this once you have decided on all cuts and subtitles. "
             "Follows the edl.json schema from SKILL.md."
         ),
         "input_schema": {
