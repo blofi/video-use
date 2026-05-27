@@ -46,7 +46,7 @@ async def _load_skill_md():
     global SKILL_MD
     p = HERE / "SKILL.md"
     if p.exists():
-        async with aiofiles.open(p) as f:
+        async with aiofiles.open(p, encoding="utf-8") as f:
             SKILL_MD = await f.read()
 
 
@@ -54,7 +54,7 @@ async def _load_skill_md():
 
 @app.get("/")
 async def index():
-    async with aiofiles.open(STATIC_DIR / "app.html") as f:
+    async with aiofiles.open(STATIC_DIR / "app.html", encoding="utf-8") as f:
         return HTMLResponse(await f.read())
 
 
@@ -166,7 +166,7 @@ async def get_project():
     for attr, fname in (("edl", "edl.json"), ("project_md", "project.md"), ("takes_packed", "takes_packed.md")):
         fp = EDIT_DIR / fname
         if fp.exists():
-            async with aiofiles.open(fp) as f:
+            async with aiofiles.open(fp, encoding="utf-8") as f:
                 raw = await f.read()
             result[attr] = json.loads(raw) if fname.endswith(".json") else raw
 
@@ -298,7 +298,7 @@ async def _run_tool(name: str, tool_input: dict, ws: WebSocket) -> str:
         )
         EDIT_DIR.mkdir(parents=True, exist_ok=True)
         edl_path = EDIT_DIR / "edl.json"
-        async with aiofiles.open(edl_path, "w") as f:
+        async with aiofiles.open(edl_path, "w", encoding="utf-8") as f:
             await f.write(json.dumps(edl, indent=2))
         n = len(edl.get("ranges", []))
         return (
