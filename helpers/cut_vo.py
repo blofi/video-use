@@ -2,13 +2,13 @@
 
 Aligns the script against the word-level ElevenLabs transcript using
 difflib.SequenceMatcher, extracts the matching audio segments with 30ms
-crossfade joins, and writes a pre-timed WAV that maps 1:1 to the output
-timeline (silence inserted for grab/PTC ranges so the file can be mixed
-directly as a flat vo_track from t=0).
+crossfade joins, and writes vo_clean.wav (the spliced VO audio only —
+no silence padding).  Silence at grab/PTC positions is applied at render
+time by helpers/render.py via an ffmpeg volume envelope, so the WAV
+length simply equals the sum of kept segment durations.
 
 Usage:
     python helpers/cut_vo.py <source_wav> --script "approved text" --edit-dir edit/
-    python helpers/cut_vo.py <source_wav> --script "approved text" --edit-dir edit/ --edl edit/edl.json
     python helpers/cut_vo.py <source_wav> --script-file approved.txt --edit-dir edit/
 """
 
@@ -298,11 +298,12 @@ def cut_vo(
     source_path: Path,
     script: str,
     edit_dir: Path,
-    edl: dict | None = None,
+    edl: dict | None = None,  # kept for CLI compat; silence is now applied in render.py
     out_wav: Path | None = None,
     out_words: Path | None = None,
 ) -> dict:
     """Splice source_path to match script. Returns a result dict."""
+    import shutil
     edit_dir.mkdir(parents=True, exist_ok=True)
     out_wav = out_wav or edit_dir / "vo_clean.wav"
     out_words = out_words or edit_dir / "vo_words.json"
@@ -343,13 +344,8 @@ def cut_vo(
         spliced_wav = Path(tmp) / "spliced.wav"
         print("splicing audio segments…")
         splice_segments(source_path, segments, spliced_wav)
-
-        if edl:
-            print("inserting silence for grab/PTC ranges…")
-            insert_sync_silence(spliced_wav, edl, out_wav)
-        else:
-            import shutil
-            shutil.copy2(spliced_wav, out_wav)
+        # Silence at grab/PTC positions is handled in render.py via volume envelope.
+        shutil.copy2(spliced_wav, out_wav)
 
     output_words = compute_output_words(kept_words, segments)
     out_words.write_text(json.dumps(output_words, indent=2))

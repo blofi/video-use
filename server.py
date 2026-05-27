@@ -461,7 +461,7 @@ TOOLS = [
     },
     {
         "name": "timeline_view",
-        "description": "Generate a filmstrip+waveform PNG for a time range. Use at decision points (ambiguous cuts, take comparisons, self-eval).",
+        "description": "Generate a filmstrip+waveform PNG for a time range. Use at decision points (ambiguous cuts, take comparisons, self-eval). Source must be a video file — do not call on standalone WAV/audio files.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -498,11 +498,10 @@ TOOLS = [
         "name": "cut_vo",
         "description": (
             "Splice a voiceover WAV to match an approved script. "
-            "Aligns the script against the word-level transcript, extracts matching segments with 30ms crossfade joins, "
-            "and inserts silence at grab/PTC ranges so the output WAV aligns with the output timeline. "
-            "Writes edit/vo_clean.wav and edit/vo_words.json. "
-            "Call ONLY after the user has approved the script from clean_vo. "
-            "Set use_edl=true when the edit contains grabs or PTCs (recommended)."
+            "Aligns the script against the word-level transcript and extracts matching segments with 30ms crossfade joins. "
+            "Writes edit/vo_clean.wav (the spliced VO audio) and edit/vo_words.json. "
+            "Silence during grab/PTC ranges is applied automatically at render time — no special handling needed here. "
+            "Call ONLY after the user has approved the script from clean_vo."
         ),
         "input_schema": {
             "type": "object",
@@ -583,10 +582,25 @@ async def _run_tool(name: str, tool_input: dict, ws: WebSocket) -> str:
         await proc.wait()
         if proc.returncode != 0:
             return "cut_vo failed:\n" + "\n".join(lines[-20:])
+        result: dict = {}
         for line in reversed(lines):
             if line.startswith("RESULT:"):
-                return line[len("RESULT:"):]
-        return "cut_vo complete — edit/vo_clean.wav and edit/vo_words.json written."
+                try:
+                    result = json.loads(line[len("RESULT:"):])
+                except Exception:
+                    pass
+                break
+        if result.get("status") == "error":
+            return f"cut_vo error: {result.get('message')}"
+        msg = result.get("message", "VO spliced successfully.")
+        return (
+            f"{msg}\n\n"
+            "NEXT STEP — call write_edl to add vo_track to the EDL:\n"
+            '  "vo_track": {"file": "edit/vo_clean.wav", "vol": 1.0}\n\n'
+            "Also set audio_mode: \"sync\" on any GRAB or PTC ranges so the VO is "
+            "automatically silenced during those segments at render time.\n"
+            "Then call render_preview to hear the result."
+        )
 
     if name == "write_edl":
         edl = tool_input["edl"]

@@ -667,6 +667,7 @@ def build_final_composite(
     out_path: Path,
     edit_dir: Path,
     vo_track: dict | None = None,
+    sync_intervals: list[tuple[float, float]] = (),
 ) -> None:
     """Final pass: base → overlays (PTS-shifted) → subtitles LAST → out.
 
@@ -733,12 +734,19 @@ def build_final_composite(
         else:
             out_label = "[0:v]"
 
-    # VO audio mix — amix base audio with the pre-timed VO WAV
+    # VO audio mix — amix base audio with VO WAV, muting VO during sync (grab/PTC) ranges
     if has_vo:
         vol = float(vo_track.get("vol", 1.0))
+        if sync_intervals:
+            # Silence VO whenever the playhead is inside a sync range
+            cond = "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in sync_intervals)
+            vol_expr = f"if({cond},0,{vol:.3f})"
+            vo_vol_filter = f"[{vo_input_idx}:a]volume=volume='{vol_expr}'[vo_a]"
+        else:
+            vo_vol_filter = f"[{vo_input_idx}:a]volume={vol:.3f}[vo_a]"
         filter_parts.append(
             f"[0:a]volume=1.0[base_a];"
-            f"[{vo_input_idx}:a]volume={vol:.3f}[vo_a];"
+            f"{vo_vol_filter};"
             f"[base_a][vo_a]amix=inputs=2:duration=longest:dropout_transition=0[aout]"
         )
         audio_map = ["-map", "[aout]"]
@@ -855,13 +863,29 @@ def main() -> None:
     # 4. Composite (overlays + subtitles LAST) → intermediate (pre-loudnorm) path
     overlays = edl.get("overlays") or []
     vo_track = edl.get("vo_track") or None
+
+    # Compute output-timeline intervals where camera audio should play (VO muted).
+    sync_intervals: list[tuple[float, float]] = []
+    if vo_track:
+        t = 0.0
+        for r in edl.get("ranges", []):
+            dur = float(r["end"]) - float(r["start"])
+            beat = (r.get("beat") or "").upper()
+            if r.get("audio_mode") == "sync" or any(
+                kw in beat for kw in ("GRAB", "PTC", "SYNC", "INTERVIEW", "SOT")
+            ):
+                sync_intervals.append((t, t + dur))
+            t += dur
+
     if args.no_loudnorm:
         # Composite directly to final output
-        build_final_composite(base_path, overlays, subs_path, out_path, edit_dir, vo_track=vo_track)
+        build_final_composite(base_path, overlays, subs_path, out_path, edit_dir,
+                              vo_track=vo_track, sync_intervals=sync_intervals)
     else:
         # Composite to a temp file, then run loudnorm → final output
         tmp_composite = out_path.with_suffix(".prenorm.mp4")
-        build_final_composite(base_path, overlays, subs_path, tmp_composite, edit_dir, vo_track=vo_track)
+        build_final_composite(base_path, overlays, subs_path, tmp_composite, edit_dir,
+                              vo_track=vo_track, sync_intervals=sync_intervals)
         print("loudness normalization → social-ready (-14 LUFS / -1 dBTP / LRA 11)")
         apply_loudnorm_two_pass(tmp_composite, out_path, preview=args.draft)
         tmp_composite.unlink(missing_ok=True)
