@@ -592,6 +592,11 @@ def measure_loudness(video_path: Path) -> dict[str, str] | None:
     needed = {"input_i", "input_tp", "input_lra", "input_thresh", "target_offset"}
     if not needed.issubset(data.keys()):
         return None
+    # Completely silent audio produces offset=inf, which ffmpeg rejects. Treat as
+    # unmeasurable so the caller falls back to a plain copy instead of crashing.
+    if data.get("input_i") in ("-inf", "inf") or data.get("target_offset") in ("inf", "-inf"):
+        print(f"  loudnorm: source audio is silent (I={data.get('input_i')} LUFS) — skipping normalization")
+        return None
     return data
 
 
@@ -628,8 +633,12 @@ def apply_loudnorm_two_pass(
     print(f"  loudnorm pass 1: measuring {input_path.name}")
     measurement = measure_loudness(input_path)
     if measurement is None:
-        print("  loudnorm measurement failed — falling back to 1-pass")
-        return apply_loudnorm_two_pass(input_path, output_path, preview=True)
+        print("  loudnorm measurement failed or silent — copying without normalization")
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(input_path), "-c", "copy", str(output_path)],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        return True
 
     print(f"    measured: I={measurement['input_i']} LUFS  "
           f"TP={measurement['input_tp']}  LRA={measurement['input_lra']}")
@@ -752,10 +761,10 @@ def build_final_composite(
         vol = float(vo_track.get("vol", 1.0))
         if sync_intervals:
             sync_cond = "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in sync_intervals)
-            # Camera at full volume during sync; silenced during VO segments
-            cam_filter = f"[0:a]volume=volume='if({sync_cond},1.0,0.0)'[base_a]"
-            # VO plays during non-sync segments; silenced during sync
-            vo_filter = f"[{vo_input_idx}:a]volume=volume='if({sync_cond},0.0,{vol:.3f})'[vo_a]"
+            # eval=frame is required so that 't' is re-evaluated on every audio frame
+            # rather than once at filter init (the default eval=once freezes 't' at 0).
+            cam_filter = f"[0:a]volume=volume='if({sync_cond},1.0,0.0)':eval=frame[base_a]"
+            vo_filter = f"[{vo_input_idx}:a]volume=volume='if({sync_cond},0.0,{vol:.3f})':eval=frame[vo_a]"
         else:
             # No sync segments at all — silence camera, pass VO at requested volume
             cam_filter = f"[0:a]volume=0.0[base_a]"
@@ -787,6 +796,9 @@ def build_final_composite(
     ]
     print(f"compositing → {out_path.name}")
     print(f"  overlays: {len(overlays)}, subtitles: {'yes' if has_subs else 'no'}, vo_track: {'yes' if has_vo else 'no'}")
+    if has_vo:
+        print(f"  vo file: {vo_path}")
+        print(f"  sync intervals (camera plays): {sync_intervals}")
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
