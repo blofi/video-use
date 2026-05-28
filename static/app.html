@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>video-use</title>
+<title>Video-Chainsaw</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -515,6 +515,18 @@ body {
   pointer-events: none;
   display: block;
 }
+#crop-frame-wrap.loading::after {
+  content: 'Loading…';
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0,0,0,0.55);
+  color: #aaa;
+  font-size: 13px;
+  pointer-events: none;
+}
 #crop-overlay {
   position: absolute;
   top: 0;
@@ -550,7 +562,7 @@ body {
 
 <!-- Header -->
 <div id="header">
-  <span class="logo">video-use</span>
+  <span class="logo">Video-Chainsaw</span>
   <span class="path" id="proj-path" title="Click to change folder">—</span>
   <input id="path-input" type="text" spellcheck="false" placeholder="Paste folder path and press Enter">
   <span id="path-error"></span>
@@ -613,7 +625,7 @@ body {
   <div id="crop-modal-inner">
     <div id="crop-modal-title">Set vertical crop position</div>
     <div id="crop-frame-wrap">
-      <img id="crop-frame-img" alt="frame" />
+      <img id="crop-frame-img" alt="" />
       <div id="crop-overlay"></div>
     </div>
     <div id="sub-shot-strip"></div>
@@ -1245,8 +1257,11 @@ function openCropEditor(seg, rangeIndex, subOffset, subDuration) {
   // Find x_crop: pending map > saved sub_crops > range x_crop
   cropXCrop = resolveXCrop(seg, cropSubOffset);
 
-  // Load frame at midpoint of the active sub-shot
+  // Load frame at midpoint of the active sub-shot (cached on disk after first fetch)
   const frameT = seg.start + cropSubOffset + cropSubDuration / 2;
+  cropFrameWrap.classList.add('loading');
+  cropFrameImg.onload  = () => cropFrameWrap.classList.remove('loading');
+  cropFrameImg.onerror = () => cropFrameWrap.classList.remove('loading');
   cropFrameImg.src = `/api/frame?source=${encodeURIComponent(seg._sourcePath || '')}&t=${frameT.toFixed(3)}`;
 
   document.getElementById('crop-modal-title').textContent =
@@ -1292,8 +1307,11 @@ function buildSubShotStrip(seg, rangeIndex) {
       // Load from pending map first, then saved, then default
       cropXCrop = resolveXCrop(seg, offset);
 
-      const frameT = seg.start + offset + dur / 2;
-      cropFrameImg.src = `/api/frame?source=${encodeURIComponent(seg._sourcePath || '')}&t=${frameT.toFixed(3)}`;
+      const subFrameT = seg.start + offset + dur / 2;
+      cropFrameWrap.classList.add('loading');
+      cropFrameImg.onload  = () => cropFrameWrap.classList.remove('loading');
+      cropFrameImg.onerror = () => cropFrameWrap.classList.remove('loading');
+      cropFrameImg.src = `/api/frame?source=${encodeURIComponent(seg._sourcePath || '')}&t=${subFrameT.toFixed(3)}`;
       document.getElementById('crop-modal-title').textContent =
         `Set vertical crop — ${seg.beat || seg.source} · sub-shot at ${(seg.start + offset).toFixed(2)}s`;
 

@@ -7,9 +7,11 @@ Usage:
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 # Load .env from the project directory before anything else
@@ -25,7 +27,7 @@ import aiofiles
 import anthropic
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 HERE = Path(__file__).parent
@@ -50,19 +52,28 @@ SKILL_MD: str = ""
 VIDEOS_DIR: Path = Path(".")
 EDIT_DIR: Path = Path("edit")
 
-app = FastAPI()
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
-
-# ── Startup ────────────────────────────────────────────────────────────────────
-
-@app.on_event("startup")
-async def _load_skill_md():
+@asynccontextmanager
+async def lifespan(_app):
     global SKILL_MD
+    # Suppress WinError 10054 spam — ProactorEventLoop fires ConnectionResetError
+    # when a browser drops a connection, which is harmless but fills the console.
+    if sys.platform == "win32":
+        loop = asyncio.get_event_loop()
+        _orig = loop.get_exception_handler() or loop.default_exception_handler
+        def _handler(lp, ctx):
+            if isinstance(ctx.get("exception"), ConnectionResetError):
+                return
+            _orig(lp, ctx)
+        loop.set_exception_handler(_handler)
     p = HERE / "SKILL.md"
     if p.exists():
         async with aiofiles.open(p, encoding="utf-8") as f:
             SKILL_MD = await f.read()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 # ── SPA ────────────────────────────────────────────────────────────────────────
@@ -252,7 +263,7 @@ async def api_render(request: Request):
 
 @app.get("/api/frame")
 async def api_frame(source: str, t: float, request: Request):
-    """Extract a single JPEG frame at time t from source for the vertical crop editor."""
+    """Extract a single JPEG frame at time t, cached to edit/shot_frames/."""
     raw = Path(source) if Path(source).is_absolute() else VIDEOS_DIR / source
     p = resolve_source_path(str(raw))
     if not p.exists() or not p.is_file():
@@ -262,24 +273,115 @@ async def api_frame(source: str, t: float, request: Request):
     except ValueError:
         raise HTTPException(status_code=403, detail="Access denied")
 
+    cache_dir = EDIT_DIR / "shot_frames"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    key = hashlib.md5(f"{p}:{t:.3f}".encode()).hexdigest()[:16]
+    cache_path = cache_dir / f"{p.stem}_{key}.jpg"
+
+    if not (cache_path.exists() and cache_path.stat().st_size > 100):
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", f"{t:.3f}",
+            "-i", str(p),
+            "-frames:v", "1",
+            "-q:v", "4",
+            "-vf", "scale=640:-2",
+            str(cache_path),
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        except asyncio.TimeoutError:
+            try: proc.kill()
+            except Exception: pass
+            raise HTTPException(status_code=504, detail="Frame extraction timed out")
+
+    if not (cache_path.exists() and cache_path.stat().st_size > 100):
+        raise HTTPException(status_code=500, detail="Frame extraction failed")
+
+    return FileResponse(str(cache_path), media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=86400"})
+
+
+# ── Background frame/loop pre-generation helpers ───────────────────────────────
+
+async def _ensure_shot_frame(p: Path, t: float) -> None:
+    """Pre-generate and cache a JPEG frame at time t (same logic as /api/frame)."""
+    cache_dir = EDIT_DIR / "shot_frames"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    key = hashlib.md5(f"{p}:{t:.3f}".encode()).hexdigest()[:16]
+    cache_path = cache_dir / f"{p.stem}_{key}.jpg"
+    if cache_path.exists() and cache_path.stat().st_size > 100:
+        return
+    cmd = [
+        "ffmpeg", "-y", "-ss", f"{t:.3f}", "-i", str(p),
+        "-frames:v", "1", "-q:v", "4", "-vf", "scale=640:-2",
+        str(cache_path),
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=10.0)
+    except Exception:
+        try: proc.kill()
+        except Exception: pass
+
+
+async def _ensure_shot_loop(p: Path, shot_start: float, shot_end: float) -> "Path | None":
+    """Generate (if not cached) a 320px looping MP4 for the crop editor."""
+    duration = min(shot_end - shot_start, 2.5)
+    if duration < 0.1:
+        return None
+    cache_dir = EDIT_DIR / "shot_loops"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    key = hashlib.md5(f"{p}:{shot_start:.3f}:{shot_end:.3f}".encode()).hexdigest()[:16]
+    cache_path = cache_dir / f"{p.stem}_{key}.mp4"
+    if cache_path.exists() and cache_path.stat().st_size > 200:
+        return cache_path
+
+    mid = (shot_start + shot_end) / 2
+    loop_start = max(shot_start, mid - duration / 2)
     cmd = [
         "ffmpeg", "-y",
-        "-ss", f"{t:.3f}",
+        "-ss", f"{loop_start:.3f}",
         "-i", str(p),
-        "-frames:v", "1",
-        "-q:v", "3",
-        "-vf", "scale=960:-2",
-        "-f", "image2pipe",
-        "-vcodec", "mjpeg",
-        "pipe:1",
+        "-t", f"{duration:.3f}",
+        "-vf", "scale=320:-2",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "45",
+        "-an", "-movflags", "+faststart",
+        str(cache_path),
     ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
-    )
-    jpeg_bytes, _ = await proc.communicate()
-    if proc.returncode != 0 or not jpeg_bytes:
-        raise HTTPException(status_code=500, detail="Frame extraction failed")
-    return StreamingResponse(iter([jpeg_bytes]), media_type="image/jpeg")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=15.0)
+    except Exception:
+        try: proc.kill()
+        except Exception: pass
+        return None
+    return cache_path if (cache_path.exists() and cache_path.stat().st_size > 200) else None
+
+
+@app.get("/api/shot_loop")
+async def api_shot_loop(source: str, start: float, end: float):
+    """Return a cached tiny looping MP4 for the crop editor, generating on demand."""
+    p = resolve_source_path(source)
+    if not p.exists() or not p.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    try:
+        p.relative_to(VIDEOS_DIR)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    cache_path = await _ensure_shot_loop(p, start, end)
+    if cache_path is None:
+        raise HTTPException(status_code=500, detail="Loop generation failed")
+    return FileResponse(str(cache_path), media_type="video/mp4",
+                        headers={"Cache-Control": "public, max-age=86400"})
 
 
 # ── API: set per-range crop ────────────────────────────────────────────────────
@@ -353,6 +455,16 @@ async def api_shots(source: str, start: float = 0.0, end: float = 1e9,
             all_cuts = [{"time": 0.0, "score": 100.0}]
 
     cuts_in_range = [c for c in all_cuts if start - 0.1 <= c["time"] <= end + 0.1]
+
+    # Pre-generate midpoint frames in the background so the crop modal opens instantly
+    async def _pregenerate_frames():
+        for i, cut in enumerate(cuts_in_range):
+            nxt = cuts_in_range[i + 1] if i + 1 < len(cuts_in_range) else None
+            shot_end = nxt["time"] if nxt else end
+            mid = (cut["time"] + shot_end) / 2
+            await _ensure_shot_frame(p, mid)
+    asyncio.ensure_future(_pregenerate_frames())
+
     return JSONResponse({"cuts": cuts_in_range, "source": str(p)})
 
 
