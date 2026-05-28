@@ -24,6 +24,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # -------- Subtitle style (bold-overlay, proven at 1920×1080 and 1080×1920) --
@@ -53,11 +54,23 @@ def run(cmd: list[str], quiet: bool = False) -> None:
 
 
 def resolve_path(maybe_path: str, base: Path) -> Path:
-    """Resolve a path that may be absolute or relative to `base`."""
+    """Resolve a path that may be absolute or relative to `base`.
+
+    If the resolved path doesn't exist, do a case-insensitive filename search
+    in the same directory so that e.g. `.MXF` is found when the EDL says `.mxf`.
+    """
     p = Path(maybe_path)
-    if p.is_absolute():
-        return p
-    return (base / p).resolve()
+    resolved = p if p.is_absolute() else (base / p).resolve()
+    if resolved.exists():
+        return resolved
+    # Case-insensitive fallback: scan the parent directory
+    parent = resolved.parent
+    name_lower = resolved.name.lower()
+    if parent.is_dir():
+        for candidate in parent.iterdir():
+            if candidate.name.lower() == name_lower:
+                return candidate
+    return resolved  # return original path so ffmpeg error message is meaningful
 
 
 # -------- HDR → SDR tone mapping (HLG / PQ sources) --------------------------
@@ -100,16 +113,29 @@ def is_hdr_source(video: Path) -> bool:
 
 
 def get_video_dimensions(video: Path) -> tuple[int, int]:
-    """Return (width, height) of the first video stream. Returns (0, 0) on error."""
+    """Return (width, height) of the first video stream. Returns (0, 0) on error.
+
+    Requests both width/height and coded_width/coded_height because broadcast
+    MXF (XDCAM, IMX, DNxHD, etc.) stores dimensions only in the coded_* fields.
+    Falls back to coded_* when the plain fields are absent or zero.
+    """
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height",
+             "-show_entries", "stream=width,height,coded_width,coded_height",
              "-of", "csv=p=0", str(video)],
             capture_output=True, text=True, check=True,
         )
-        w, h = map(int, out.stdout.strip().split(","))
-        return w, h
+        # Take only the first line (some containers produce multiple entries)
+        first = out.stdout.strip().splitlines()[0]
+        parts = first.split(",")
+        def _int(s: str) -> int:
+            try:
+                return int(s)
+            except (ValueError, TypeError):
+                return 0
+        w, h, cw, ch = (_int(parts[i]) if i < len(parts) else 0 for i in range(4))
+        return (w or cw, h or ch)
     except Exception:
         return 0, 0
 
@@ -201,6 +227,7 @@ def extract_segment(
     draft: bool = False,
     vertical: bool = False,
     audio_streams: int = 1,
+    x_crop: float | None = None,
 ) -> None:
     """Extract a cut range as its own MP4 with 30ms audio fades baked in.
 
@@ -232,7 +259,12 @@ def extract_segment(
         # Compute scaled width (even), then find subject x via gradient energy
         scaled_w = int(src_w * scale_h / src_h)
         scaled_w -= scaled_w % 2
-        x = find_subject_x(source, seg_start, seg_start + duration, scaled_w, crop_w)
+        if x_crop is not None:
+            raw_x = int((scaled_w - crop_w) * x_crop)
+            raw_x = max(0, min(scaled_w - crop_w, raw_x))
+            x = raw_x - raw_x % 2
+        else:
+            x = find_subject_x(source, seg_start, seg_start + duration, scaled_w, crop_w)
         crop = f"crop={crop_w}:{crop_h}:{x}:0"
     else:
         # Normal horizontal output (or portrait source staying portrait).
@@ -311,7 +343,7 @@ def extract_all_segments(
     sources = edl["sources"]
 
     seg_paths: list[Path] = []
-    print(f"extracting {len(ranges)} segment(s) → {clips_dir.name}/")
+    print(f"extracting {len(ranges)} segment(s) -> {clips_dir.name}/")
     for i, r in enumerate(ranges):
         src_name = r["source"]
         src_path = resolve_path(sources[src_name], edit_dir)
@@ -322,8 +354,26 @@ def extract_all_segments(
 
         note = r.get("beat") or r.get("note") or ""
         print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
-        extract_segment(src_path, start, duration, out_path, preview=preview, draft=draft, vertical=vertical, audio_streams=audio_streams)
-        seg_paths.append(out_path)
+        sub_crops = r.get("sub_crops") if vertical else None
+        if sub_crops and len(sub_crops) > 1:
+            # Split range at each sub-crop boundary; extract each slice with its own crop
+            sorted_sc = sorted(sub_crops, key=lambda s: float(s["offset"]))
+            for j, sc in enumerate(sorted_sc):
+                sub_start = start + float(sc["offset"])
+                sub_end = (start + float(sorted_sc[j + 1]["offset"])) if j + 1 < len(sorted_sc) else end
+                sub_dur = sub_end - sub_start
+                if sub_dur < 0.05:
+                    continue
+                sub_path = clips_dir / f"seg_{i:02d}_{src_name}_s{j:02d}.mp4"
+                extract_segment(src_path, sub_start, sub_dur, sub_path,
+                                preview=preview, draft=draft, vertical=vertical,
+                                audio_streams=audio_streams, x_crop=sc.get("x_crop"))
+                seg_paths.append(sub_path)
+        else:
+            extract_segment(src_path, start, duration, out_path,
+                            preview=preview, draft=draft, vertical=vertical,
+                            audio_streams=audio_streams, x_crop=r.get("x_crop"))
+            seg_paths.append(out_path)
 
     return seg_paths
 
@@ -345,7 +395,7 @@ def concat_segments(segment_paths: list[Path], out_path: Path, edit_dir: Path) -
         "-movflags", "+faststart",
         str(out_path),
     ]
-    print(f"concat → {out_path.name}")
+    print(f"concat -> {out_path.name}")
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     concat_list.unlink(missing_ok=True)
 
@@ -448,7 +498,87 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
         lines.append(t)
         lines.append("")
     out_path.write_text("\n".join(lines))
-    print(f"master SRT → {out_path.name} ({len(entries)} cues)")
+    print(f"master SRT -> {out_path.name} ({len(entries)} cues)")
+
+
+# -------- VO WAV timeline expansion -----------------------------------------
+
+
+def _expand_vo_wav(
+    compact_wav: Path,
+    sync_intervals: list[tuple[float, float]],
+    total_duration: float,
+    out_wav: Path,
+    sample_rate: int = 48000,
+) -> None:
+    """Rewrite compact VO WAV to full output-timeline duration.
+
+    cut_vo.py writes a compact WAV (just the spliced VO audio, no silence).
+    Played via amix, the WAV advances continuously — during sync windows it
+    is muted by the volume envelope but still consumes samples, so the read
+    position drifts out of sync with the VO windows that follow.
+
+    This function rebuilds the WAV so it is the same length as the output video:
+      - VO intervals  → audio read sequentially from compact_wav
+      - sync intervals → digital silence (aevalsrc=0)
+
+    After expansion a plain constant-volume amix aligns correctly.
+    """
+    # Build ordered list of (start, end, is_sync) covering 0..total_duration
+    intervals: list[tuple[float, float, bool]] = []
+    prev = 0.0
+    for s, e in sorted(sync_intervals):
+        if prev < s - 0.001:
+            intervals.append((prev, s, False))
+        intervals.append((s, e, True))
+        prev = e
+    if prev < total_duration - 0.001:
+        intervals.append((prev, total_duration, False))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        parts: list[Path] = []
+        vo_offset = 0.0  # read cursor in compact_wav
+
+        for i, (start, end, is_sync) in enumerate(intervals):
+            dur = end - start
+            if dur < 0.001:
+                continue
+            part = tmp_dir / f"part_{i:03d}.wav"
+            if is_sync:
+                subprocess.run([
+                    "ffmpeg", "-y", "-f", "lavfi",
+                    "-i", f"aevalsrc=0:channel_layout=mono:sample_rate={sample_rate}:duration={dur:.4f}",
+                    "-c:a", "pcm_s16le", str(part),
+                ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            else:
+                subprocess.run([
+                    "ffmpeg", "-y",
+                    "-ss", f"{vo_offset:.4f}",
+                    "-i", str(compact_wav),
+                    "-t", f"{dur:.4f}",
+                    "-vn", "-ac", "1", "-ar", str(sample_rate), "-c:a", "pcm_s16le",
+                    str(part),
+                ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                vo_offset += dur
+            parts.append(part)
+
+        if not parts:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", str(compact_wav), "-c", "copy", str(out_wav)],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            )
+            return
+
+        concat_list = tmp_dir / "concat.txt"
+        concat_list.write_text("".join(f"file '{p.resolve()}'\n" for p in parts))
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_list),
+            "-vn", "-ac", "1", "-ar", str(sample_rate), "-c:a", "pcm_s16le",
+            str(out_wav),
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
 # -------- Loudness normalization (social-ready audio) -----------------------
@@ -492,6 +622,11 @@ def measure_loudness(video_path: Path) -> dict[str, str] | None:
     needed = {"input_i", "input_tp", "input_lra", "input_thresh", "target_offset"}
     if not needed.issubset(data.keys()):
         return None
+    # Completely silent audio produces offset=inf, which ffmpeg rejects. Treat as
+    # unmeasurable so the caller falls back to a plain copy instead of crashing.
+    if data.get("input_i") in ("-inf", "inf") or data.get("target_offset") in ("inf", "-inf"):
+        print(f"  loudnorm: source audio is silent (I={data.get('input_i')} LUFS) — skipping normalization")
+        return None
     return data
 
 
@@ -520,7 +655,7 @@ def apply_loudnorm_two_pass(
             "-movflags", "+faststart",
             str(output_path),
         ]
-        print(f"  loudnorm (1-pass preview) → {output_path.name}")
+        print(f"  loudnorm (1-pass preview) -> {output_path.name}")
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         return True
 
@@ -528,8 +663,12 @@ def apply_loudnorm_two_pass(
     print(f"  loudnorm pass 1: measuring {input_path.name}")
     measurement = measure_loudness(input_path)
     if measurement is None:
-        print("  loudnorm measurement failed — falling back to 1-pass")
-        return apply_loudnorm_two_pass(input_path, output_path, preview=True)
+        print("  loudnorm measurement failed or silent — copying without normalization")
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(input_path), "-c", "copy", str(output_path)],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        return True
 
     print(f"    measured: I={measurement['input_i']} LUFS  "
           f"TP={measurement['input_tp']}  LRA={measurement['input_lra']}")
@@ -552,7 +691,7 @@ def apply_loudnorm_two_pass(
         "-movflags", "+faststart",
         str(output_path),
     ]
-    print(f"  loudnorm pass 2: normalizing → {output_path.name}")
+    print(f"  loudnorm pass 2: normalizing -> {output_path.name}")
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     return True
 
@@ -564,33 +703,97 @@ def build_final_composite(
     base_path: Path,
     subtitles_path: Path | None,
     out_path: Path,
+    edit_dir: Path,
+    vo_track: dict | None = None,
+    sync_intervals: list[tuple[float, float]] = (),
 ) -> None:
-    """Final pass: base → subtitles LAST → out.
+    """Final pass: subtitles LAST -> out.
 
-    If there are no subtitles, just copy base to out.
+    If there are no subtitles and no vo_track, just copy base to out.
+    When vo_track is provided, the pre-timed vo_clean.wav is mixed under the video
+    audio via amix. The WAV must already have silence at grab/PTC positions so it
+    aligns 1:1 with the output timeline (produced by helpers/cut_vo.py).
     """
     has_subs = subtitles_path is not None and subtitles_path.exists()
+    has_vo = bool(vo_track)
+    if has_vo:
+        vo_path = resolve_path(vo_track["file"], edit_dir)
+        if not vo_path.exists():
+            # Relative paths in vo_track.file are sometimes written relative to the
+            # project root (parent of edit_dir), e.g. "edit/vo_clean.wav". Try that.
+            vo_path = resolve_path(vo_track["file"], edit_dir.parent)
+        if not vo_path.exists():
+            print(
+                f"warning: vo_track file not found: {vo_track['file']!r}\n"
+                f"  tried: {vo_path}\n"
+                f"  VO will be absent from output — fix the path and re-render."
+            )
+            has_vo = False
 
-    if not has_subs:
+    if not has_subs and not has_vo:
         run(["ffmpeg", "-y", "-i", str(base_path), "-c", "copy", str(out_path)], quiet=True)
         return
 
-    subs_abs = str(subtitles_path.resolve()).replace(":", r"\:").replace("'", r"\'")
-    filter_str = f"subtitles='{subs_abs}':force_style='{SUB_FORCE_STYLE}'"
+    inputs: list[str] = ["-i", str(base_path)]
+    vo_input_idx: int | None = None
+    if has_vo:
+        inputs += ["-i", str(vo_path)]
+        vo_input_idx = 1
+
+    filter_parts: list[str] = []
+
+    # Subtitles LAST — Rule 1
+    if has_subs:
+        subs_abs = str(subtitles_path.resolve()).replace(":", r"\:").replace("'", r"\'")
+        filter_parts.append(
+            f"[0:v]subtitles='{subs_abs}':force_style='{SUB_FORCE_STYLE}'[outv]"
+        )
+        out_label = "[outv]"
+    elif has_vo:
+        filter_parts.append(f"[0:v]null[outv]")
+        out_label = "[outv]"
+    else:
+        out_label = "[0:v]"
+
+    # VO audio mix
+    if has_vo:
+        vol = float(vo_track.get("vol", 1.0))
+        if sync_intervals:
+            sync_cond = "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in sync_intervals)
+            cam_filter = f"[0:a]volume=volume='if({sync_cond},1.0,0.0)':eval=frame[base_a]"
+            vo_filter = f"[{vo_input_idx}:a]volume={vol:.3f}[vo_a]"
+        else:
+            cam_filter = f"[0:a]volume=0.0[base_a]"
+            vo_filter = f"[{vo_input_idx}:a]volume={vol:.3f}[vo_a]"
+        filter_parts.append(
+            f"{cam_filter};"
+            f"{vo_filter};"
+            f"[base_a][vo_a]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[aout]"
+        )
+        audio_map = ["-map", "[aout]"]
+        audio_codec = ["-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
+    else:
+        audio_map = ["-map", "0:a"]
+        audio_codec = ["-c:a", "copy"]
+
+    filter_complex = ";".join(filter_parts)
 
     cmd = [
         "ffmpeg", "-y",
-        "-i", str(base_path),
-        "-vf", filter_str,
-        "-map", "0:v",
-        "-map", "0:a",
+        *inputs,
+        "-filter_complex", filter_complex,
+        "-map", out_label,
+        *audio_map,
         "-c:v", "libx264", "-preset", "fast", "-crf", "18",
         "-pix_fmt", "yuv420p",
-        "-c:a", "copy",
+        *audio_codec,
         "-movflags", "+faststart",
         str(out_path),
     ]
-    print(f"subtitles → {out_path.name}")
+    print(f"subtitles/VO -> {out_path.name}")
+    if has_vo:
+        print(f"  vo file: {vo_path}")
+        print(f"  sync intervals (camera plays): {sync_intervals}")
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
@@ -680,15 +883,47 @@ def main() -> None:
                 print(f"warning: subtitles path in EDL does not exist: {subs_path}")
                 subs_path = None
 
-    # 4. Subtitles LAST → intermediate (pre-loudnorm) path
+    # 4. Subtitles LAST -> intermediate (pre-loudnorm) path
+    vo_track = edl.get("vo_track") or None
+
+    # Compute output-timeline intervals where camera audio should play (VO muted).
+    sync_intervals: list[tuple[float, float]] = []
+    total_dur = 0.0
+    if vo_track:
+        t = 0.0
+        for r in edl.get("ranges", []):
+            dur = float(r["end"]) - float(r["start"])
+            beat = (r.get("beat") or "").upper()
+            if r.get("audio_mode") == "sync" or any(
+                kw in beat for kw in ("GRAB", "PTC", "SYNC", "INTERVIEW", "SOT")
+            ):
+                sync_intervals.append((t, t + dur))
+            t += dur
+        total_dur = t
+
+    # Expand compact VO WAV to full output-timeline duration before mixing.
+    if vo_track and sync_intervals:
+        _vo_path = resolve_path(vo_track["file"], edit_dir)
+        if not _vo_path.exists():
+            _vo_path = resolve_path(vo_track["file"], edit_dir.parent)
+        if _vo_path.exists() and _vo_path.stat().st_size > 200:
+            expanded_wav = edit_dir / "vo_expanded.wav"
+            print(f"  expanding VO WAV -> {total_dur:.1f}s timeline "
+                  f"({len(sync_intervals)} sync interval(s))")
+            _expand_vo_wav(_vo_path, sync_intervals, total_dur, expanded_wav)
+            vo_track = dict(vo_track)
+            vo_track["file"] = str(expanded_wav)
+
     if args.no_loudnorm:
         # Composite directly to final output
-        build_final_composite(base_path, subs_path, out_path)
+        build_final_composite(base_path, subs_path, out_path, edit_dir,
+                              vo_track=vo_track, sync_intervals=sync_intervals)
     else:
-        # Composite to a temp file, then run loudnorm → final output
+        # Composite to a temp file, then run loudnorm -> final output
         tmp_composite = out_path.with_suffix(".prenorm.mp4")
-        build_final_composite(base_path, subs_path, tmp_composite)
-        print("loudness normalization → social-ready (-14 LUFS / -1 dBTP / LRA 11)")
+        build_final_composite(base_path, subs_path, tmp_composite, edit_dir,
+                              vo_track=vo_track, sync_intervals=sync_intervals)
+        print("loudness normalization -> social-ready (-14 LUFS / -1 dBTP / LRA 11)")
         apply_loudnorm_two_pass(tmp_composite, out_path, preview=args.draft)
         tmp_composite.unlink(missing_ok=True)
 

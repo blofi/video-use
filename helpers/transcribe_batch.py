@@ -23,7 +23,7 @@ from pathlib import Path
 from transcribe import load_api_key, transcribe_one
 
 
-VIDEO_EXTS = {".mp4", ".MP4", ".mov", ".MOV", ".mkv", ".MKV", ".avi", ".AVI", ".m4v", ".mxf", ".MXF"}
+VIDEO_EXTS = {".mp4", ".MP4", ".mov", ".MOV", ".mkv", ".MKV", ".avi", ".AVI", ".m4v", ".mxf", ".MXF", ".wav", ".WAV", ".aif", ".AIF", ".aiff", ".AIFF"}
 
 
 def find_videos(videos_dir: Path) -> list[Path]:

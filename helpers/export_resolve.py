@@ -75,6 +75,27 @@ def fr(s: float, fps: float) -> int:
 # -------- Shot extraction -----------------------------------------------------
 
 
+def get_video_dimensions(source: Path) -> tuple[int, int]:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height,coded_width,coded_height",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(source)],
+        capture_output=True, text=True, check=True,
+    )
+    vals = [int(v) for v in out.stdout.split() if v.strip().lstrip("-").isdigit() and int(v) > 0]
+    if len(vals) >= 2:
+        return vals[0], vals[1]
+    return 1920, 1080
+
+
+def vertical_crop_params(src_w: int, src_h: int, x_crop: float) -> tuple[int, int, int, int]:
+    """Return (crop_w, crop_h, x, y) for a 9:16 vertical window from a 16:9 source."""
+    crop_w = (src_h * 9 // 16) & ~1   # must be even
+    crop_h = src_h & ~1
+    x = int((src_w - crop_w) * max(0.0, min(1.0, x_crop))) & ~1
+    return crop_w, crop_h, x, 0
+
+
 def extract_shot_with_handles(
     source: Path,
     seg_start: float,
@@ -84,12 +105,12 @@ def extract_shot_with_handles(
     src_duration: float,
     shot_name: str,
     out_path: Path,
+    crop: tuple[int, int, int, int] | None = None,
 ) -> tuple[float, float]:
     """Extract a ProRes 422 HQ shot with handles and embedded source TC.
 
     Returns (actual_h_in, actual_h_out) in source seconds.
-    Explicit stream mapping ensures the correct audio stream is selected from
-    multi-stream sources (e.g. broadcast MXF with programme mix on 0:a:0).
+    If crop=(w,h,x,y) is provided, a crop filter is applied (for vertical exports).
     """
     handle_s = handle_frames / fps
     h_in  = max(0.0,         seg_start - handle_s)
@@ -97,12 +118,14 @@ def extract_shot_with_handles(
     tc    = "01:00:00:00"   # always fixed — we own these clips
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    vf = ["-vf", f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}"] if crop else []
     cmd = [
         "ffmpeg", "-y",
         "-ss", f"{h_in:.6f}",
         "-i", str(source),
         "-t", f"{h_out - h_in:.6f}",
         "-map", "0:v:0", "-map", "0:a:0",
+        *vf,
         "-c:v", "prores_ks", "-profile:v", "3",  # ProRes 422 HQ
         "-pix_fmt", "yuv422p10le",
         "-c:a", "pcm_s24le", "-ar", "48000",
@@ -199,16 +222,47 @@ def write_readme(shots: list[dict], handle_frames: int, fps: float, out_path: Pa
 # -------- Main orchestrator ---------------------------------------------------
 
 
+def load_shot_cuts(edit_dir: Path, src_stem: str, range_start: float, range_end: float) -> list[float]:
+    """Return shot boundary times within [range_start, range_end] from cached shot file.
+
+    Returns a list of split points *between* the range start and end (exclusive of both
+    endpoints), sorted ascending. Empty list means no intra-range cuts detected.
+    """
+    cache_path = edit_dir / "shots" / f"{src_stem}.json"
+    if not cache_path.exists():
+        return []
+    try:
+        data = json.loads(cache_path.read_text())
+        cuts = data.get("cuts", [])
+        # Keep cuts strictly inside the range (not at the endpoints themselves)
+        return sorted(
+            c["time"] for c in cuts
+            if range_start + 0.1 < c["time"] < range_end - 0.1
+        )
+    except Exception:
+        return []
+
+
 def build_package(
     edl_path: Path,
     handle_frames: int = 25,
     fps_override: float | None = None,
     make_zip: bool = False,
     out_zip: Path | None = None,
+    vertical: bool = False,
+    split_shots: bool = False,
 ) -> Path:
     edl = json.loads(edl_path.read_text())
     edit_dir = edl_path.parent
-    shots_dir = edit_dir / "resolve_shots"
+
+    if vertical:
+        folder_name = "resolve_shots_vertical"
+    elif split_shots:
+        folder_name = "resolve_shots_split"
+    else:
+        folder_name = "resolve_shots"
+
+    shots_dir = edit_dir / folder_name
     shots_dir.mkdir(parents=True, exist_ok=True)
 
     sources = edl["sources"]
@@ -219,40 +273,77 @@ def build_package(
         src_path = resolve_path(src_rel, edit_dir)
         fps = fps_override or detect_fps(src_path)
         dur = detect_duration(src_path)
-        src_meta[src_key] = {"path": src_path, "fps": fps, "duration": dur}
+        w, h = get_video_dimensions(src_path) if vertical else (0, 0)
+        src_meta[src_key] = {"path": src_path, "fps": fps, "duration": dur, "w": w, "h": h}
 
     fps = src_meta[next(iter(sources))]["fps"]
 
     shots: list[dict] = []
     timeline_offset = 0.0
+    clip_idx = 0
 
-    print(f"extracting {len(ranges)} shot(s) — ProRes 422 HQ, {handle_frames}-frame handles → resolve_shots/")
+    if vertical:
+        label = "vertical 9:16"
+    elif split_shots:
+        label = "16:9 split at shot boundaries"
+    else:
+        label = "16:9"
+    print(f"extracting {len(ranges)} range(s) — ProRes 422 HQ {label}, {handle_frames}-frame handles → {folder_name}/")
     for i, r in enumerate(ranges):
         src_name = r["source"]
         meta = src_meta[src_name]
         src_path = meta["path"]
         seg_start = float(r["start"])
         seg_end = float(r["end"])
-        cut_dur = seg_end - seg_start
         beat = r.get("beat") or r.get("note") or ""
-        shot_name = f"shot_{i + 1:02d}_{src_name}"
 
-        out_path = shots_dir / f"{shot_name}.mov"
-        print(f"  [{i + 1:02d}] {src_name}  {seg_start:.2f}-{seg_end:.2f}  ({cut_dur:.2f}s)  {beat}")
+        # Build sub-segments list: (start, end, x_crop)
+        sub_segs: list[tuple[float, float, float]] = []
+        if vertical:
+            # Split at sub_crops boundaries, each with its own x_crop
+            sub_crops = r.get("sub_crops") or []
+            if len(sub_crops) > 1:
+                sub_crops_sorted = sorted(sub_crops, key=lambda c: c["offset"])
+                for j, sc in enumerate(sub_crops_sorted):
+                    ss = seg_start + sc["offset"]
+                    se = seg_start + sub_crops_sorted[j + 1]["offset"] if j + 1 < len(sub_crops_sorted) else seg_end
+                    sub_segs.append((ss, se, float(sc["x_crop"])))
+            else:
+                x_crop = float(sub_crops[0]["x_crop"] if sub_crops else r.get("x_crop", 0.5))
+                sub_segs.append((seg_start, seg_end, x_crop))
+        elif split_shots:
+            # Split at detected shot boundaries from cached scdet results
+            src_path_for_shots = meta["path"]
+            cut_times = load_shot_cuts(edit_dir, src_path_for_shots.stem, seg_start, seg_end)
+            boundaries = [seg_start] + cut_times + [seg_end]
+            for j in range(len(boundaries) - 1):
+                sub_segs.append((boundaries[j], boundaries[j + 1], 0.5))
+        else:
+            sub_segs.append((seg_start, seg_end, 0.5))
 
-        h_in, h_out = extract_shot_with_handles(
-            src_path, seg_start, seg_end, handle_frames, meta["fps"], meta["duration"],
-            shot_name, out_path,
-        )
-        shots.append({
-            "file": out_path,
-            "seg_start": seg_start,
-            "cut_duration": cut_dur,
-            "h_in": h_in,
-            "h_out": h_out,
-            "timeline_offset": timeline_offset,
-        })
-        timeline_offset += cut_dur
+        for j, (ss, se, x_crop) in enumerate(sub_segs):
+            clip_idx += 1
+            cut_dur = se - ss
+            suffix = f"_s{j + 1:02d}" if len(sub_segs) > 1 else ""
+            shot_name = f"shot_{clip_idx:02d}_{src_name}{suffix}"
+            crop = vertical_crop_params(meta["w"], meta["h"], x_crop) if vertical else None
+            out_path = shots_dir / f"{shot_name}.mov"
+            sub_label = f" sub-shot {j + 1}/{len(sub_segs)}" if len(sub_segs) > 1 else ""
+            print(f"  [{clip_idx:02d}] {src_name}{sub_label}  {ss:.2f}-{se:.2f}  ({cut_dur:.2f}s)  {beat}")
+
+            h_in, h_out = extract_shot_with_handles(
+                src_path, ss, se, handle_frames, meta["fps"], meta["duration"],
+                shot_name, out_path, crop=crop,
+            )
+            shots.append({
+                "file": out_path,
+                "seg_start": ss,
+                "cut_duration": cut_dur,
+                "h_in": h_in,
+                "h_out": h_out,
+                "timeline_offset": timeline_offset,
+            })
+            timeline_offset += cut_dur
 
     otio_path = shots_dir / "timeline.otio"
     readme_path = shots_dir / "README.txt"
@@ -266,12 +357,18 @@ def build_package(
 
     if make_zip:
         if out_zip is None:
-            out_zip = edit_dir / "resolve_package.zip"
+            if vertical:
+                zip_name = "resolve_package_vertical.zip"
+            elif split_shots:
+                zip_name = "resolve_package_shots.zip"
+            else:
+                zip_name = "resolve_package.zip"
+            out_zip = edit_dir / zip_name
         with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
             for shot in shots:
-                zf.write(shot["file"], f"resolve_shots/{shot['file'].name}")
-            zf.write(otio_path, "resolve_shots/timeline.otio")
-            zf.write(readme_path, "resolve_shots/README.txt")
+                zf.write(shot["file"], f"{folder_name}/{shot['file'].name}")
+            zf.write(otio_path, f"{folder_name}/timeline.otio")
+            zf.write(readme_path, f"{folder_name}/README.txt")
         size_mb = out_zip.stat().st_size / (1024 * 1024)
         print(f"      zipped → {out_zip} ({size_mb:.1f} MB)")
         return out_zip
@@ -299,7 +396,15 @@ def main() -> None:
     )
     ap.add_argument(
         "-o", "--output", type=Path, default=None,
-        help="Output zip path when --zip is set (default: <edit_dir>/resolve_package.zip)",
+        help="Output zip path when --zip is set (default: <edit_dir>/resolve_package[_vertical].zip)",
+    )
+    ap.add_argument(
+        "--vertical", action="store_true",
+        help="Bake 9:16 crop (x_crop per range) into each clip for vertical delivery",
+    )
+    ap.add_argument(
+        "--split-shots", action="store_true",
+        help="Split each range at detected shot boundaries (reads edit/shots/ cache)",
     )
     args = ap.parse_args()
 
@@ -314,6 +419,8 @@ def main() -> None:
         fps_override=args.fps,
         make_zip=args.zip,
         out_zip=out_zip,
+        vertical=args.vertical,
+        split_shots=args.split_shots,
     )
 
 

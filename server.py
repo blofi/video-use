@@ -31,6 +31,21 @@ from fastapi.staticfiles import StaticFiles
 HERE = Path(__file__).parent
 STATIC_DIR = HERE / "static"
 
+
+def resolve_source_path(path_str: str) -> Path:
+    """Return a Path for path_str, falling back to a case-insensitive match
+    in the same directory when the exact path doesn't exist (e.g. .MXF vs .mxf)."""
+    p = Path(path_str)
+    if p.exists():
+        return p
+    parent = p.parent
+    name_lower = p.name.lower()
+    if parent.is_dir():
+        for candidate in parent.iterdir():
+            if candidate.name.lower() == name_lower:
+                return candidate
+    return p
+
 SKILL_MD: str = ""
 VIDEOS_DIR: Path = Path(".")
 EDIT_DIR: Path = Path("edit")
@@ -188,7 +203,8 @@ async def get_project():
                 raw = await f.read()
             result[attr] = json.loads(raw) if fname.endswith(".json") else raw
 
-    video_exts = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".mxf", ".MP4", ".MOV", ".MKV", ".MXF"}
+    video_exts = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".mxf", ".wav", ".aif", ".aiff",
+                  ".MP4", ".MOV", ".MKV", ".MXF", ".WAV", ".AIF", ".AIFF"}
     for f in sorted(VIDEOS_DIR.iterdir()):
         if f.suffix in video_exts and f.is_file():
             result["sources"].append({"name": f.name, "path": str(f)})
@@ -205,11 +221,18 @@ async def api_render(request: Request):
     edl_path = EDIT_DIR / "edl.json"
     if not edl_path.exists():
         raise HTTPException(status_code=400, detail="edl.json not found — ask the editor to create a cut first")
-    out_name = "preview.mp4" if mode == "preview" else "final.mp4"
+    if mode == "preview":
+        out_name = "preview.mp4"
+    elif mode == "vertical":
+        out_name = "vertical.mp4"
+    else:
+        out_name = "final.mp4"
     out_path = EDIT_DIR / out_name
     cmd = [sys.executable, str(HERE / "helpers" / "render.py"), str(edl_path), "-o", str(out_path)]
     if mode == "preview":
         cmd.append("--preview")
+    elif mode == "vertical":
+        cmd.append("--vertical")
 
     async def _sse():
         proc = await asyncio.create_subprocess_exec(
@@ -225,18 +248,180 @@ async def api_render(request: Request):
     return StreamingResponse(_sse(), media_type="text/event-stream")
 
 
-# ── API: export Resolve package ────────────────────────────────────────────────
+# ── API: frame extraction (for crop editor) ────────────────────────────────────
 
-@app.post("/api/export")
-async def api_export():
+@app.get("/api/frame")
+async def api_frame(source: str, t: float, request: Request):
+    """Extract a single JPEG frame at time t from source for the vertical crop editor."""
+    raw = Path(source) if Path(source).is_absolute() else VIDEOS_DIR / source
+    p = resolve_source_path(str(raw))
+    if not p.exists() or not p.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    try:
+        p.relative_to(VIDEOS_DIR)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{t:.3f}",
+        "-i", str(p),
+        "-frames:v", "1",
+        "-q:v", "3",
+        "-vf", "scale=960:-2",
+        "-f", "image2pipe",
+        "-vcodec", "mjpeg",
+        "pipe:1",
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+    )
+    jpeg_bytes, _ = await proc.communicate()
+    if proc.returncode != 0 or not jpeg_bytes:
+        raise HTTPException(status_code=500, detail="Frame extraction failed")
+    return StreamingResponse(iter([jpeg_bytes]), media_type="image/jpeg")
+
+
+# ── API: set per-range crop ────────────────────────────────────────────────────
+
+@app.post("/api/set_crop")
+async def api_set_crop(request: Request):
+    """Write x_crop (0.0–1.0) for a single EDL range."""
+    body = await request.json()
+    range_index = int(body["range_index"])
+    x_crop = max(0.0, min(1.0, float(body["x_crop"])))
+
     edl_path = EDIT_DIR / "edl.json"
     if not edl_path.exists():
         raise HTTPException(status_code=400, detail="edl.json not found")
-    zip_path = EDIT_DIR / "resolve_package.zip"
+
+    async with aiofiles.open(edl_path) as f:
+        edl = json.loads(await f.read())
+
+    if range_index < 0 or range_index >= len(edl.get("ranges", [])):
+        raise HTTPException(status_code=400, detail="range_index out of bounds")
+
+    edl["ranges"][range_index]["x_crop"] = round(x_crop, 4)
+
+    async with aiofiles.open(edl_path, "w") as f:
+        await f.write(json.dumps(edl, indent=2))
+
+    return JSONResponse({"ok": True, "range_index": range_index, "x_crop": edl["ranges"][range_index]["x_crop"]})
+
+
+# ── API: shot boundary detection ───────────────────────────────────────────────
+
+@app.get("/api/shots")
+async def api_shots(source: str, start: float = 0.0, end: float = 1e9,
+                    threshold: float = 5.0, force: bool = False):
+    """Return shot cut timestamps within [start, end] for a source file."""
+    p = resolve_source_path(source)
+    if not p.exists() or not p.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    try:
+        p.relative_to(VIDEOS_DIR)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    cache_dir = EDIT_DIR / "shots"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"{p.stem}.json"
+
+    if cache_path.exists() and not force:
+        data = json.loads(cache_path.read_text())
+        if abs(data.get("threshold", -1) - threshold) < 0.01:
+            all_cuts = data["cuts"]
+        else:
+            all_cuts = None
+    else:
+        all_cuts = None
+
+    if all_cuts is None:
+        cmd = [
+            sys.executable, str(HERE / "helpers" / "detect_shots.py"),
+            str(p), "--edit-dir", str(EDIT_DIR), "--threshold", str(threshold),
+        ]
+        if force:
+            cmd.append("--force")
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        )
+        await proc.communicate()
+        if cache_path.exists():
+            all_cuts = json.loads(cache_path.read_text())["cuts"]
+        else:
+            all_cuts = [{"time": 0.0, "score": 100.0}]
+
+    cuts_in_range = [c for c in all_cuts if start - 0.1 <= c["time"] <= end + 0.1]
+    return JSONResponse({"cuts": cuts_in_range, "source": str(p)})
+
+
+# ── API: set per-range sub-shot crop ───────────────────────────────────────────
+
+@app.post("/api/set_sub_crop")
+async def api_set_sub_crop(request: Request):
+    """Write x_crop for a specific sub-shot (by offset from range start) in an EDL range."""
+    body = await request.json()
+    range_index = int(body["range_index"])
+    offset = round(float(body["offset"]), 4)
+    x_crop = max(0.0, min(1.0, float(body["x_crop"])))
+
+    edl_path = EDIT_DIR / "edl.json"
+    if not edl_path.exists():
+        raise HTTPException(status_code=400, detail="edl.json not found")
+
+    async with aiofiles.open(edl_path) as f:
+        edl = json.loads(await f.read())
+
+    ranges = edl.get("ranges", [])
+    if range_index < 0 or range_index >= len(ranges):
+        raise HTTPException(status_code=400, detail="range_index out of bounds")
+
+    sub_crops = ranges[range_index].get("sub_crops") or []
+    # Upsert by offset (within 50ms tolerance)
+    updated = False
+    for sc in sub_crops:
+        if abs(sc["offset"] - offset) < 0.05:
+            sc["x_crop"] = round(x_crop, 4)
+            updated = True
+            break
+    if not updated:
+        sub_crops.append({"offset": offset, "x_crop": round(x_crop, 4)})
+    sub_crops.sort(key=lambda s: s["offset"])
+    ranges[range_index]["sub_crops"] = sub_crops
+
+    async with aiofiles.open(edl_path, "w") as f:
+        await f.write(json.dumps(edl, indent=2))
+
+    return JSONResponse({"ok": True, "range_index": range_index, "sub_crops": sub_crops})
+
+
+# ── API: export Resolve package ────────────────────────────────────────────────
+
+@app.post("/api/export")
+async def api_export(request: Request):
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    mode = body.get("mode", "normal") if isinstance(body, dict) else "normal"
+    vertical = mode == "vertical"
+    split_shots = mode == "shots"
+    edl_path = EDIT_DIR / "edl.json"
+    if not edl_path.exists():
+        raise HTTPException(status_code=400, detail="edl.json not found")
+    if vertical:
+        zip_name = "resolve_package_vertical.zip"
+    elif split_shots:
+        zip_name = "resolve_package_shots.zip"
+    else:
+        zip_name = "resolve_package.zip"
+    zip_path = EDIT_DIR / zip_name
     cmd = [
         sys.executable, str(HERE / "helpers" / "export_resolve.py"),
         str(edl_path), "--zip", "-o", str(zip_path),
     ]
+    if vertical:
+        cmd.append("--vertical")
+    if split_shots:
+        cmd.append("--split-shots")
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
     )
@@ -245,7 +430,8 @@ async def api_export():
         raise HTTPException(status_code=500, detail=stdout.decode(errors="replace"))
     if not zip_path.exists():
         raise HTTPException(status_code=500, detail="Export produced no zip file")
-    return JSONResponse({"path": "edit/resolve_package.zip", "size": zip_path.stat().st_size})
+    rel = f"edit/{zip_name}"
+    return JSONResponse({"path": rel, "size": zip_path.stat().st_size})
 
 
 # ── LLM tool definitions ───────────────────────────────────────────────────────
@@ -277,13 +463,23 @@ TOOLS = [
         "input_schema": {"type": "object", "properties": {}},
     },
     {
+        "name": "render_vertical",
+        "description": (
+            "Render a 1080×1920 (9:16) vertical MP4 from the current edl.json. "
+            "Use this when the user wants a vertical/portrait version for social media. "
+            "Honours x_crop values set on each range; falls back to auto subject-tracking if absent. "
+            "Output: edit/vertical.mp4."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "run_transcribe",
         "description": "Transcribe all video files in the project directory then pack into takes_packed.md. Run this first when no transcript exists.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {
         "name": "timeline_view",
-        "description": "Generate a filmstrip+waveform PNG for a time range. Use at decision points (ambiguous cuts, take comparisons, self-eval).",
+        "description": "Generate a filmstrip+waveform PNG for a time range. Use at decision points (ambiguous cuts, take comparisons, self-eval). Source must be a video file — do not call on standalone WAV/audio files.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -299,6 +495,42 @@ TOOLS = [
         "description": "Return the full contents of takes_packed.md. Use this to read the transcript before making cut decisions.",
         "input_schema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "clean_vo",
+        "description": (
+            "Read the raw voiceover transcript for a WAV/audio file and return the word-level text. "
+            "Transcribes first if no cached transcript exists. "
+            "Returns the raw transcript so you can tidy it (remove stumbles, fillers, false starts, "
+            "fix grammar) and present the cleaned script to the user for review. "
+            "Do NOT call cut_vo until the user has approved or edited the script."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "source_path": {"type": "string", "description": "Absolute path to the WAV or audio file"},
+            },
+            "required": ["source_path"],
+        },
+    },
+    {
+        "name": "cut_vo",
+        "description": (
+            "Splice a voiceover WAV to match an approved script. "
+            "Aligns the script against the word-level transcript and extracts matching segments with 30ms crossfade joins. "
+            "Writes edit/vo_clean.wav (the spliced VO audio) and edit/vo_words.json. "
+            "Silence during grab/PTC ranges is applied automatically at render time — no special handling needed here. "
+            "Call ONLY after the user has approved the script from clean_vo."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "source_path": {"type": "string", "description": "Absolute path to the original WAV file"},
+                "script": {"type": "string", "description": "The approved/edited script text"},
+                "use_edl": {"type": "boolean", "description": "Read current edl.json for grab/PTC silence insertion (default true)"},
+            },
+            "required": ["source_path", "script"],
+        },
+    },
 ]
 
 
@@ -308,6 +540,86 @@ async def _run_tool(name: str, tool_input: dict, ws: WebSocket) -> str:
         if packed.exists():
             return packed.read_text()
         return "No transcript found. Call run_transcribe first."
+
+    if name == "clean_vo":
+        source_path = Path(str(resolve_source_path(tool_input["source_path"])))
+        stem = source_path.stem
+        transcript_path = EDIT_DIR / "transcripts" / f"{stem}.json"
+        if not transcript_path.exists():
+            await ws.send_json({"type": "tool_progress", "tool": name,
+                                "line": f"No cached transcript — transcribing {source_path.name}…"})
+            cmd = [
+                sys.executable, str(HERE / "helpers" / "transcribe.py"),
+                str(source_path), "--edit-dir", str(EDIT_DIR),
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+            )
+            lines: list[str] = []
+            async for line in proc.stdout:
+                text = line.decode(errors="replace").rstrip()
+                lines.append(text)
+                await ws.send_json({"type": "tool_progress", "tool": name, "line": text})
+            await proc.wait()
+            if proc.returncode != 0:
+                return "Transcription failed:\n" + "\n".join(lines[-10:])
+        raw = json.loads(transcript_path.read_text())
+        words = [w for w in raw.get("words", []) if w.get("type") == "word"]
+        raw_text = " ".join(w.get("text", "").strip() for w in words if w.get("text", "").strip())
+        return (
+            f"Raw transcript for {source_path.name} ({len(words)} words):\n\n"
+            f"{raw_text}\n\n"
+            "Tidy this transcript (remove stumbles, false starts, fillers; fix grammar) "
+            "and present the cleaned script to the user for review before calling cut_vo."
+        )
+
+    if name == "cut_vo":
+        source_path = str(resolve_source_path(tool_input["source_path"]))
+        script = tool_input["script"]
+        use_edl = tool_input.get("use_edl", True)
+        cmd = [
+            sys.executable, str(HERE / "helpers" / "cut_vo.py"),
+            source_path,
+            "--script", script,
+            "--edit-dir", str(EDIT_DIR),
+            "--out-wav", str(EDIT_DIR / "vo_clean.wav"),
+            "--out-words", str(EDIT_DIR / "vo_words.json"),
+        ]
+        if use_edl:
+            edl_p = EDIT_DIR / "edl.json"
+            if edl_p.exists():
+                cmd += ["--edl", str(edl_p)]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        )
+        lines: list[str] = []
+        async for line in proc.stdout:
+            text = line.decode(errors="replace").rstrip()
+            lines.append(text)
+            await ws.send_json({"type": "tool_progress", "tool": name, "line": text})
+        await proc.wait()
+        if proc.returncode != 0:
+            return "cut_vo failed:\n" + "\n".join(lines[-20:])
+        result: dict = {}
+        for line in reversed(lines):
+            if line.startswith("RESULT:"):
+                try:
+                    result = json.loads(line[len("RESULT:"):])
+                except Exception:
+                    pass
+                break
+        if result.get("status") == "error":
+            return f"cut_vo error: {result.get('message')}"
+        msg = result.get("message", "VO spliced successfully.")
+        return (
+            f"{msg}\n\n"
+            "NEXT STEP — call write_edl to add vo_track to the EDL:\n"
+            '  "vo_track": {"file": "edit/vo_clean.wav", "vol": 1.0}\n\n'
+            "Also set audio_mode: \"sync\" on any GRAB or PTC ranges so the VO is "
+            "automatically silenced during those segments at render time.\n"
+            "Then call render_preview to hear the result."
+        )
+
     if name == "write_edl":
         edl = tool_input["edl"]
         # Always recompute — don't trust the LLM's arithmetic
@@ -325,16 +637,20 @@ async def _run_tool(name: str, tool_input: dict, ws: WebSocket) -> str:
             "Call render_preview to see the cut."
         )
 
-    if name in ("render_preview", "render_final"):
+    if name in ("render_preview", "render_final", "render_vertical"):
         edl_path = EDIT_DIR / "edl.json"
         if not edl_path.exists():
             return "Error: edl.json not found. Call write_edl first."
-        mode = "preview" if name == "render_preview" else "final"
-        out_name = "preview.mp4" if mode == "preview" else "final.mp4"
+        if name == "render_preview":
+            out_name, extra_flag = "preview.mp4", "--preview"
+        elif name == "render_vertical":
+            out_name, extra_flag = "vertical.mp4", "--vertical"
+        else:
+            out_name, extra_flag = "final.mp4", None
         out_path = EDIT_DIR / out_name
         cmd = [sys.executable, str(HERE / "helpers" / "render.py"), str(edl_path), "-o", str(out_path)]
-        if mode == "preview":
-            cmd.append("--preview")
+        if extra_flag:
+            cmd.append(extra_flag)
 
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
@@ -347,6 +663,7 @@ async def _run_tool(name: str, tool_input: dict, ws: WebSocket) -> str:
         await proc.wait()
 
         if proc.returncode == 0:
+            mode = name.replace("render_", "")
             await ws.send_json({"type": "render_done", "path": f"edit/{out_name}", "mode": mode})
             return f"{mode.title()} render complete: {out_path}"
         return f"Render failed (exit {proc.returncode}):\n" + "\n".join(lines[-20:])
@@ -385,7 +702,7 @@ async def _run_tool(name: str, tool_input: dict, ws: WebSocket) -> str:
         return "Transcription ran but takes_packed.md was not created."
 
     if name == "timeline_view":
-        source = tool_input["source_path"]
+        source = str(resolve_source_path(tool_input["source_path"]))
         start = float(tool_input["start"])
         end = float(tool_input["end"])
         stem = Path(source).stem
@@ -430,8 +747,11 @@ def _build_system() -> list[dict]:
         "- The transcript (takes_packed.md) is injected directly into this system prompt below — "
         "you already have it. You do NOT need to read any files to access it.\n"
         "- If for any reason you need to re-read the transcript, use the `read_transcript` tool.\n"
-        "- Your only tools are: write_edl, render_preview, render_final, run_transcribe, "
-        "timeline_view, read_transcript.\n"
+        "- Your only tools are: write_edl, render_preview, render_final, render_vertical, run_transcribe, "
+        "timeline_view, read_transcript, clean_vo, cut_vo.\n"
+        "- Use render_vertical to produce a 1080×1920 9:16 social-media version; it honours x_crop on each range.\n"
+        "- VO workflow: call clean_vo on the WAV → tidy the transcript → present to user → user approves → call cut_vo → write_edl with vo_track + audio_mode:sync on grabs/PTCs → render.\n"
+        "- Set audio_mode:'sync' on grab and PTC ranges so camera audio plays there; omit (defaults to 'vo') on B-roll.\n"
         "- Always confirm the editing strategy in plain English before calling write_edl.\n\n"
         f"Videos directory: {VIDEOS_DIR}\nEdit directory: {EDIT_DIR}\n\n"
     )
@@ -452,7 +772,7 @@ def _build_system() -> list[dict]:
             "text": (
                 "No transcript yet. Use run_transcribe to transcribe and pack the source videos. "
                 f"Source videos in {VIDEOS_DIR}: "
-                + ", ".join(f.name for f in sorted(VIDEOS_DIR.iterdir()) if f.suffix.lower() in {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".mxf"})
+                + ", ".join(f.name for f in sorted(VIDEOS_DIR.iterdir()) if f.suffix.lower() in {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".mxf", ".wav", ".aif", ".aiff"})
             ),
         })
 
