@@ -288,7 +288,7 @@ def build_package(
         label = "16:9 split at shot boundaries"
     else:
         label = "16:9"
-    print(f"extracting {len(ranges)} range(s) — ProRes 422 HQ {label}, {handle_frames}-frame handles → {folder_name}/")
+    print(f"extracting {len(ranges)} range(s) - ProRes 422 HQ {label}, {handle_frames}-frame handles -> {folder_name}/")
     for i, r in enumerate(ranges):
         src_name = r["source"]
         meta = src_meta[src_name]
