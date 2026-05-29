@@ -239,11 +239,15 @@ async def api_render(request: Request):
     else:
         out_name = "final.mp4"
     out_path = EDIT_DIR / out_name
+    edl_data = json.loads(edl_path.read_text())
     cmd = [sys.executable, str(HERE / "helpers" / "render.py"), str(edl_path), "-o", str(out_path)]
     if mode == "preview":
         cmd.append("--preview")
     elif mode == "vertical":
         cmd.append("--vertical")
+    audio_streams = int(edl_data.get("audio_streams", 1))
+    if audio_streams > 1:
+        cmd += ["--audio-streams", str(audio_streams)]
 
     async def _sse():
         proc = await asyncio.create_subprocess_exec(
@@ -581,12 +585,14 @@ TOOLS = [
         "description": (
             "Write the EDL (Edit Decision List) to disk at edit/edl.json. "
             "Call this once you have decided on all cuts and subtitles. "
-            "Follows the edl.json schema from SKILL.md."
+            "Follows the edl.json schema from SKILL.md. "
+            "For broadcast MXF sources with multiple audio streams (e.g. VO on 0:a:0, NAT/SOT on 0:a:1) "
+            "set audio_streams=2 at the top level of the EDL so the renderer amixes all streams."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "edl": {"type": "object", "description": "Complete EDL object per the edl.json schema"}
+                "edl": {"type": "object", "description": "Complete EDL object per the edl.json schema. Include audio_streams:2 for broadcast MXF with multi-track audio."}
             },
             "required": ["edl"],
         },
@@ -787,9 +793,13 @@ async def _run_tool(name: str, tool_input: dict, ws: WebSocket) -> str:
         else:
             out_name, extra_flag = "final.mp4", None
         out_path = EDIT_DIR / out_name
+        ws_edl = json.loads(edl_path.read_text())
         cmd = [sys.executable, str(HERE / "helpers" / "render.py"), str(edl_path), "-o", str(out_path)]
         if extra_flag:
             cmd.append(extra_flag)
+        ws_audio_streams = int(ws_edl.get("audio_streams", 1))
+        if ws_audio_streams > 1:
+            cmd += ["--audio-streams", str(ws_audio_streams)]
 
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
@@ -891,7 +901,9 @@ def _build_system() -> list[dict]:
         "- Use render_vertical to produce a 1080×1920 9:16 social-media version; it honours x_crop on each range.\n"
         "- VO workflow: call clean_vo on the WAV → tidy the transcript → present to user → user approves → call cut_vo → write_edl with vo_track + audio_mode:sync on grabs/PTCs → render.\n"
         "- Set audio_mode:'sync' on grab and PTC ranges so camera audio plays there; omit (defaults to 'vo') on B-roll.\n"
-        "- Always confirm the editing strategy in plain English before calling write_edl.\n\n"
+        "- Always confirm the editing strategy in plain English before calling write_edl.\n"
+        "- Broadcast MXF sources (Avid news packages) split audio across tracks: VO on 0:a:0, NAT/SOT on 0:a:1. "
+        "Always set audio_streams:2 at the top level of the EDL for these sources so the renderer amixes both.\n\n"
         f"Videos directory: {VIDEOS_DIR}\nEdit directory: {EDIT_DIR}\n\n"
     )
     blocks = [
