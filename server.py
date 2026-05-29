@@ -330,46 +330,70 @@ async def _ensure_shot_frame(p: Path, t: float) -> None:
         except Exception: pass
 
 
+# Single-flight locks per cache key: a <video> element fires several parallel
+# requests (initial + Range), and on a cache miss each would otherwise spawn its
+# own ffmpeg writing to the same path, clobbering into a corrupt file.
+_shot_loop_locks: "dict[str, asyncio.Lock]" = {}
+
+
 async def _ensure_shot_loop(p: Path, shot_start: float, shot_end: float) -> "Path | None":
-    """Generate (if not cached) a 320px looping MP4 for the crop editor."""
-    duration = min(shot_end - shot_start, 2.5)
+    """Generate (if not cached) a 640px looping MP4 of the full shot for the crop editor."""
+    duration = shot_end - shot_start
     if duration < 0.1:
         return None
     cache_dir = EDIT_DIR / "shot_loops"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    key = hashlib.md5(f"{p}:{shot_start:.3f}:{shot_end:.3f}".encode()).hexdigest()[:16]
+    # LOOP_QUALITY is baked into the key so changing encode settings invalidates the cache.
+    LOOP_QUALITY = "v2-640-crf28"
+    key = hashlib.md5(f"{p}:{shot_start:.3f}:{shot_end:.3f}:{LOOP_QUALITY}".encode()).hexdigest()[:16]
     cache_path = cache_dir / f"{p.stem}_{key}.mp4"
     if cache_path.exists() and cache_path.stat().st_size > 200:
         return cache_path
 
-    mid = (shot_start + shot_end) / 2
-    loop_start = max(shot_start, mid - duration / 2)
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", f"{loop_start:.3f}",
-        "-i", str(p),
-        "-t", f"{duration:.3f}",
-        "-vf", "scale=320:-2",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "45",
-        "-an", "-movflags", "+faststart",
-        str(cache_path),
-    ]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-        )
-        await asyncio.wait_for(proc.communicate(), timeout=15.0)
-    except Exception:
-        try: proc.kill()
-        except Exception: pass
-        return None
-    return cache_path if (cache_path.exists() and cache_path.stat().st_size > 200) else None
+    lock = _shot_loop_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        # Re-check inside the lock: a concurrent request may have just built it.
+        if cache_path.exists() and cache_path.stat().st_size > 200:
+            return cache_path
+
+        # Write to a unique temp file, then atomically rename so readers never
+        # see a half-written MP4.
+        tmp_path = cache_dir / f".{key}.{os.getpid()}.tmp.mp4"
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", f"{shot_start:.3f}",
+            "-i", str(p),
+            "-t", f"{duration:.3f}",
+            "-vf", "scale=640:-2",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+            "-pix_fmt", "yuv420p",  # browsers can't decode 4:2:2/4:4:4 from broadcast sources
+            "-an", "-movflags", "+faststart",
+            str(tmp_path),
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=60.0)
+        except Exception:
+            try: proc.kill()
+            except Exception: pass
+            tmp_path.unlink(missing_ok=True)
+            return None
+
+        if not (tmp_path.exists() and tmp_path.stat().st_size > 200):
+            tmp_path.unlink(missing_ok=True)
+            return None
+
+        os.replace(tmp_path, cache_path)  # atomic on the same filesystem
+        return cache_path
 
 
 @app.get("/api/shot_loop")
 async def api_shot_loop(source: str, start: float, end: float):
     """Return a cached tiny looping MP4 for the crop editor, generating on demand."""
-    p = resolve_source_path(source)
+    raw = Path(source) if Path(source).is_absolute() else VIDEOS_DIR / source
+    p = resolve_source_path(str(raw))
     if not p.exists() or not p.is_file():
         raise HTTPException(status_code=404, detail="File not found")
     try:
@@ -381,7 +405,7 @@ async def api_shot_loop(source: str, start: float, end: float):
     if cache_path is None:
         raise HTTPException(status_code=500, detail="Loop generation failed")
     return FileResponse(str(cache_path), media_type="video/mp4",
-                        headers={"Cache-Control": "public, max-age=86400"})
+                        headers={"Cache-Control": "no-cache"})
 
 
 # ── API: set per-range crop ────────────────────────────────────────────────────
@@ -456,13 +480,16 @@ async def api_shots(source: str, start: float = 0.0, end: float = 1e9,
 
     cuts_in_range = [c for c in all_cuts if start - 0.1 <= c["time"] <= end + 0.1]
 
-    # Pre-generate midpoint frames in the background so the crop modal opens instantly
+    # Pre-generate midpoint frames in the background so the crop modal opens
+    # instantly. Shots are the spans between [range start, …internal cuts]; the
+    # range usually opens mid-shot, so the leading span (start → first cut) is a
+    # real shot whose frame must also be warmed.
     async def _pregenerate_frames():
-        for i, cut in enumerate(cuts_in_range):
-            nxt = cuts_in_range[i + 1] if i + 1 < len(cuts_in_range) else None
-            shot_end = nxt["time"] if nxt else end
-            mid = (cut["time"] + shot_end) / 2
-            await _ensure_shot_frame(p, mid)
+        bounds = [start] + [c["time"] for c in cuts_in_range
+                            if start + 0.05 < c["time"] < end - 0.05]
+        for i, b in enumerate(bounds):
+            shot_end = bounds[i + 1] if i + 1 < len(bounds) else end
+            await _ensure_shot_frame(p, (b + shot_end) / 2)
     asyncio.ensure_future(_pregenerate_frames())
 
     return JSONResponse({"cuts": cuts_in_range, "source": str(p)})

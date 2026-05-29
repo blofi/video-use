@@ -508,6 +508,7 @@ body {
   cursor: ew-resize;
   user-select: none;
 }
+#crop-frame-vid,
 #crop-frame-img {
   width: 100%;
   height: 100%;
@@ -625,11 +626,13 @@ body {
   <div id="crop-modal-inner">
     <div id="crop-modal-title">Set vertical crop position</div>
     <div id="crop-frame-wrap">
-      <img id="crop-frame-img" alt="" />
+      <video id="crop-frame-vid" autoplay loop muted playsinline></video>
+      <img id="crop-frame-img" alt="" style="display:none" />
       <div id="crop-overlay"></div>
     </div>
     <div id="sub-shot-strip"></div>
     <div id="crop-modal-actions">
+      <button class="btn btn-ghost" id="crop-preview-btn" style="margin-right:auto">▶ Preview motion</button>
       <button class="btn btn-ghost" id="crop-cancel-btn">Cancel</button>
       <button class="btn btn-blue" id="crop-set-btn">Set crop</button>
     </div>
@@ -668,10 +671,12 @@ const exportShotsBtn     = document.getElementById('export-shots-btn');
 const exportVerticalBtn  = document.getElementById('export-vertical-btn');
 
 const cropModal    = document.getElementById('crop-modal');
+const cropFrameVid = document.getElementById('crop-frame-vid');
 const cropFrameImg = document.getElementById('crop-frame-img');
 const cropOverlay  = document.getElementById('crop-overlay');
 const cropFrameWrap= document.getElementById('crop-frame-wrap');
 const cropCancelBtn= document.getElementById('crop-cancel-btn');
+const cropPreviewBtn= document.getElementById('crop-preview-btn');
 const subShotStrip = document.getElementById('sub-shot-strip');
 const cropSetBtn   = document.getElementById('crop-set-btn');
 const graticuleEl  = document.getElementById('graticule');
@@ -917,8 +922,9 @@ function injectTicks(rangeIndex, seg, cuts) {
   if (!block) return;
   const rangeDur = seg.end - seg.start;
   if (rangeDur <= 0) return;
-  // Skip the first cut (t=0, always present) — it's the block start itself
-  cuts.slice(1).forEach(cut => {
+  // Cut times are global shot starts; every in-range cut is a real internal
+  // boundary. The edge guard below drops any that sit on the range in/out.
+  cuts.forEach(cut => {
     const offsetInRange = cut.time - seg.start;
     const frac = offsetInRange / rangeDur;
     if (frac <= 0.02 || frac >= 0.98) return; // too close to edge
@@ -1257,12 +1263,10 @@ function openCropEditor(seg, rangeIndex, subOffset, subDuration) {
   // Find x_crop: pending map > saved sub_crops > range x_crop
   cropXCrop = resolveXCrop(seg, cropSubOffset);
 
-  // Load frame at midpoint of the active sub-shot (cached on disk after first fetch)
-  const frameT = seg.start + cropSubOffset + cropSubDuration / 2;
-  cropFrameWrap.classList.add('loading');
-  cropFrameImg.onload  = () => cropFrameWrap.classList.remove('loading');
-  cropFrameImg.onerror = () => cropFrameWrap.classList.remove('loading');
-  cropFrameImg.src = `/api/frame?source=${encodeURIComponent(seg._sourcePath || '')}&t=${frameT.toFixed(3)}`;
+  // Show static frame immediately; motion preview loads on demand via the button
+  const shotStart = seg.start + cropSubOffset;
+  const shotEnd   = shotStart + cropSubDuration;
+  showCropFrame(seg._sourcePath, shotStart, shotEnd);
 
   document.getElementById('crop-modal-title').textContent =
     subOffset != null
@@ -1278,17 +1282,30 @@ function openCropEditor(seg, rangeIndex, subOffset, subDuration) {
 
 function buildSubShotStrip(seg, rangeIndex) {
   subShotStrip.innerHTML = '';
-  const cuts = segmentShots[rangeIndex];
-  if (!cuts || cuts.length <= 1) {
+
+  // Cut times mark where a NEW shot begins and are global to the source; a range
+  // in/out rarely lands on a cut, so the range usually OPENS mid-shot. The shots
+  // within this clip are therefore the spans between [range start, …internal
+  // cuts]. Build that boundary list — the leading span (range start → first cut)
+  // is a real shot and must get its own pill.
+  const EPS = 0.05;
+  const cuts = segmentShots[rangeIndex] || [];
+  const internal = cuts
+    .map(c => c.time)
+    .filter(t => t > seg.start + EPS && t < seg.end - EPS)
+    .sort((a, b) => a - b);
+  const starts = [seg.start, ...internal];   // each entry is a shot start time
+
+  if (starts.length <= 1) {                   // single shot — nothing to choose
     subShotStrip.classList.remove('visible');
     return;
   }
   subShotStrip.classList.add('visible');
 
-  cuts.forEach((cut, idx) => {
-    const offset = cut.time - seg.start;
-    const nextCut = cuts[idx + 1];
-    const dur = nextCut ? (nextCut.time - cut.time) : (seg.end - cut.time);
+  starts.forEach((startT, idx) => {
+    const offset = startT - seg.start;
+    const endT   = idx + 1 < starts.length ? starts[idx + 1] : seg.end;
+    const dur    = endT - startT;
 
     const pill = document.createElement('button');
     pill.className = 'sub-shot-pill' + (Math.abs(offset - cropSubOffset) < 0.05 ? ' active' : '');
@@ -1307,13 +1324,9 @@ function buildSubShotStrip(seg, rangeIndex) {
       // Load from pending map first, then saved, then default
       cropXCrop = resolveXCrop(seg, offset);
 
-      const subFrameT = seg.start + offset + dur / 2;
-      cropFrameWrap.classList.add('loading');
-      cropFrameImg.onload  = () => cropFrameWrap.classList.remove('loading');
-      cropFrameImg.onerror = () => cropFrameWrap.classList.remove('loading');
-      cropFrameImg.src = `/api/frame?source=${encodeURIComponent(seg._sourcePath || '')}&t=${subFrameT.toFixed(3)}`;
+      showCropFrame(seg._sourcePath, startT, endT);
       document.getElementById('crop-modal-title').textContent =
-        `Set vertical crop — ${seg.beat || seg.source} · sub-shot at ${(seg.start + offset).toFixed(2)}s`;
+        `Set vertical crop — ${seg.beat || seg.source} · sub-shot at ${startT.toFixed(2)}s`;
 
       subShotStrip.querySelectorAll('.sub-shot-pill').forEach(p => p.classList.remove('active'));
       pill.classList.add('active');
@@ -1331,6 +1344,59 @@ function updateCropOverlay() {
   cropOverlay.style.width = rectW + 'px';
   cropOverlay.style.left = left + 'px';
 }
+
+// Static-frame display + on-demand motion preview ───────────────────────────
+let cropPreview = { src: '', start: 0, end: 0 };
+
+// Show the still frame for a shot; the looping clip is generated only when the
+// user presses "Preview motion" (full-shot ffmpeg encode can take a moment).
+function showCropFrame(sourcePath, shotStart, shotEnd) {
+  cropPreview = { src: sourcePath || '', start: shotStart, end: shotEnd };
+  const frameT = shotStart + (shotEnd - shotStart) / 2;
+  const srcEnc = encodeURIComponent(sourcePath || '');
+
+  // Detach handlers from any prior preview BEFORE resetting the element — an
+  // empty-src load() can emit a spurious 'error', which would otherwise re-run
+  // the old onerror and leave the next preview stuck.
+  cropFrameVid.oncanplay = null;
+  cropFrameVid.onerror = null;
+  cropFrameVid.pause();
+  cropFrameVid.removeAttribute('src');
+  cropFrameVid.load();
+  cropFrameVid.style.display = 'none';
+  cropFrameImg.style.display = '';
+  cropFrameWrap.classList.add('loading');
+  cropFrameImg.onload  = () => cropFrameWrap.classList.remove('loading');
+  cropFrameImg.onerror = () => cropFrameWrap.classList.remove('loading');
+  cropFrameImg.src = `/api/frame?source=${srcEnc}&t=${frameT.toFixed(3)}`;
+
+  cropPreviewBtn.disabled = false;
+  cropPreviewBtn.textContent = '▶ Preview motion';
+}
+
+cropPreviewBtn.addEventListener('click', () => {
+  const { src, start, end } = cropPreview;
+  if (end - start < 0.1) return;
+  const srcEnc = encodeURIComponent(src);
+  cropPreviewBtn.disabled = true;
+  cropPreviewBtn.textContent = 'Generating…';
+  cropFrameWrap.classList.add('loading');
+  cropFrameVid.oncanplay = () => {
+    cropFrameWrap.classList.remove('loading');
+    cropFrameImg.style.display = 'none';
+    cropFrameVid.style.display = '';
+    cropPreviewBtn.textContent = '▶ Motion';
+    cropPreviewBtn.disabled = false;
+  };
+  cropFrameVid.onerror = () => {
+    cropFrameWrap.classList.remove('loading');
+    cropFrameVid.style.display = 'none';
+    cropFrameImg.style.display = '';
+    cropPreviewBtn.textContent = 'Preview failed — retry';
+    cropPreviewBtn.disabled = false;
+  };
+  cropFrameVid.src = `/api/shot_loop?source=${srcEnc}&start=${start.toFixed(3)}&end=${end.toFixed(3)}&v=2`;
+});
 
 // Drag logic
 let _dragging = false;
@@ -1359,10 +1425,17 @@ cropFrameWrap.addEventListener('pointermove', e => {
 
 cropFrameWrap.addEventListener('pointerup', () => { _dragging = false; });
 
+function closeCropModal() {
+  cropFrameVid.pause();
+  cropFrameVid.src = '';
+  cropFrameImg.src = '';
+  cropModal.classList.remove('open');
+}
+
 cropCancelBtn.addEventListener('click', () => {
   delete pendingCrops[cropRangeIndex];
   cropDirty = false;
-  cropModal.classList.remove('open');
+  closeCropModal();
 });
 
 cropSetBtn.addEventListener('click', async () => {
@@ -1373,7 +1446,7 @@ cropSetBtn.addEventListener('click', async () => {
       saveCurrentToPending();
       const pending = pendingCrops[cropRangeIndex] || {};
       const entries = Object.entries(pending);
-      if (entries.length === 0) { cropModal.classList.remove('open'); return; }
+      if (entries.length === 0) { closeCropModal(); return; }
       for (const [offsetStr, xCropVal] of entries) {
         const res = await fetch('/api/set_sub_crop', {
           method: 'POST',
@@ -1397,7 +1470,7 @@ cropSetBtn.addEventListener('click', async () => {
       if (!res.ok) { const e = await res.json(); alert(e.detail); return; }
     }
     cropDirty = false;
-    cropModal.classList.remove('open');
+    closeCropModal();
     loadProject();
   } catch (err) {
     alert('Failed to save crop: ' + err.message);
